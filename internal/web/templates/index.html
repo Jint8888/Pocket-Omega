@@ -1,0 +1,929 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pocket-Omega · Thinking Chat</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: #0b0f1a;
+            color: #e2e8f0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        /* ── Subtle animated background ── */
+        body::before {
+            content: '';
+            position: fixed;
+            inset: 0;
+            background:
+                radial-gradient(ellipse 600px 400px at 20% 10%, rgba(99, 102, 241, 0.08), transparent),
+                radial-gradient(ellipse 500px 350px at 80% 90%, rgba(139, 92, 246, 0.06), transparent);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* ── Header ── */
+        header {
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 760px;
+            padding: 18px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            margin-top: 12px;
+            border-radius: 16px 16px 0 0;
+        }
+
+        .logo {
+            width: 44px;
+            height: 44px;
+            border-radius: 12px;
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a78bfa 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+            font-weight: 700;
+            color: #fff;
+            box-shadow:
+                0 0 20px rgba(99, 102, 241, 0.3),
+                0 0 40px rgba(99, 102, 241, 0.1);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .logo:hover {
+            transform: scale(1.05);
+            box-shadow:
+                0 0 24px rgba(99, 102, 241, 0.5),
+                0 0 48px rgba(99, 102, 241, 0.15);
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+        }
+
+        .title {
+            font-size: 20px;
+            font-weight: 700;
+            background: linear-gradient(135deg, #c7d2fe, #a78bfa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.3px;
+        }
+
+        .subtitle {
+            font-size: 11px;
+            color: #64748b;
+            letter-spacing: 0.5px;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .status-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #34d399;
+            box-shadow: 0 0 8px rgba(52, 211, 153, 0.5);
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        .status-text {
+            font-size: 10px;
+            color: #34d399;
+            font-weight: 600;
+            letter-spacing: 1.5px;
+            text-transform: uppercase;
+        }
+
+        /* ── Toggle switch ── */
+        .mode-toggle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+        }
+
+        .switch-track {
+            position: relative;
+            width: 38px;
+            height: 20px;
+            background: #334155;
+            border-radius: 12px;
+            transition: background 0.3s;
+            cursor: pointer;
+        }
+
+        .switch-track.active {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+        }
+
+        .switch-thumb {
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            width: 16px;
+            height: 16px;
+            background: #fff;
+            border-radius: 50%;
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+        }
+
+        .switch-track.active .switch-thumb {
+            transform: translateX(18px);
+        }
+
+        .toggle-label {
+            font-size: 12px;
+            color: #94a3b8;
+            font-weight: 500;
+            user-select: none;
+            transition: color 0.2s;
+        }
+
+        .toggle-label.active {
+            color: #a78bfa;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.4;
+            }
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* ── Chat container ── */
+        #chat-container {
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 760px;
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            scroll-behavior: smooth;
+            background: rgba(11, 15, 26, 0.5);
+        }
+
+        #chat-container::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        #chat-container::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        #chat-container::-webkit-scrollbar-thumb {
+            background: #1e293b;
+            border-radius: 4px;
+        }
+
+        #chat-container::-webkit-scrollbar-thumb:hover {
+            background: #334155;
+        }
+
+        /* ── Messages ── */
+        .msg {
+            display: flex;
+            animation: fadeInUp 0.35s ease-out;
+        }
+
+        .msg-user {
+            justify-content: flex-end;
+        }
+
+        .msg-ai {
+            justify-content: flex-start;
+        }
+
+        .msg-ai-wrapper {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            max-width: 85%;
+        }
+
+        .ai-avatar {
+            width: 32px;
+            height: 32px;
+            min-width: 32px;
+            border-radius: 10px;
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 14px;
+            font-weight: 700;
+            color: #fff;
+            margin-top: 2px;
+        }
+
+        .bubble {
+            max-width: 100%;
+            padding: 12px 16px;
+            border-radius: 16px;
+            font-size: 14px;
+            line-height: 1.7;
+            word-break: break-word;
+            white-space: pre-wrap;
+        }
+
+        .bubble-user {
+            max-width: 75%;
+            background: linear-gradient(135deg, #4f46e5, #6366f1);
+            color: #fff;
+            border-bottom-right-radius: 4px;
+            box-shadow: 0 2px 8px rgba(79, 70, 229, 0.25);
+        }
+
+        .bubble-ai {
+            background: rgba(30, 41, 59, 0.7);
+            color: #e2e8f0;
+            border: 1px solid rgba(148, 163, 184, 0.1);
+            border-bottom-left-radius: 4px;
+        }
+
+        .bubble-ai .label {
+            font-size: 11px;
+            font-weight: 600;
+            color: #a78bfa;
+            margin-bottom: 6px;
+            letter-spacing: 0.3px;
+        }
+
+        /* ── Thinking & Agent boxes ── */
+        .thinking-box {
+            background: rgba(15, 23, 42, 0.6);
+            border: 1px solid rgba(148, 163, 184, 0.08);
+            border-radius: 12px;
+            padding: 12px 16px;
+            margin-bottom: 8px;
+            font-size: 13px;
+            max-width: 90%;
+            backdrop-filter: blur(8px);
+        }
+
+        .thinking-box summary {
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            color: #a78bfa;
+            list-style: none;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .thinking-box summary::before {
+            content: "▶";
+            font-size: 9px;
+            transition: transform 0.2s;
+        }
+
+        .thinking-box[open] summary::before {
+            content: "▼";
+        }
+
+        .thought-step {
+            border-left: 2px solid rgba(99, 102, 241, 0.4);
+            padding-left: 12px;
+            margin: 10px 0;
+        }
+
+        .thought-step .step-title {
+            font-size: 11px;
+            color: #a78bfa;
+            font-weight: 600;
+        }
+
+        .thought-step pre {
+            font-size: 12px;
+            color: #94a3b8;
+            margin-top: 4px;
+            white-space: pre-wrap;
+            font-family: 'Inter', sans-serif;
+            line-height: 1.5;
+        }
+
+        .thought-step details {
+            margin-top: 6px;
+        }
+
+        .thought-step details summary {
+            font-size: 11px;
+            color: #64748b;
+            cursor: pointer;
+            list-style: none;
+        }
+
+        .thought-step details summary::before {
+            content: "▸ ";
+        }
+
+        .thought-step details[open] summary::before {
+            content: "▾ ";
+        }
+
+        .thought-step details pre {
+            font-size: 11px;
+            color: #64748b;
+        }
+
+        /* ── Loading ── */
+        .loading {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 0;
+        }
+
+        .loading-text {
+            font-size: 13px;
+            color: #a78bfa;
+        }
+
+        .dot {
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: #818cf8;
+            animation: bounce 1.4s ease-in-out infinite;
+        }
+
+        .dot:nth-child(2) {
+            animation-delay: 0.16s;
+        }
+
+        .dot:nth-child(3) {
+            animation-delay: 0.32s;
+        }
+
+        @keyframes bounce {
+
+            0%,
+            80%,
+            100% {
+                transform: scale(0);
+            }
+
+            40% {
+                transform: scale(1);
+            }
+        }
+
+        /* ── Footer / Input area ── */
+        footer {
+            position: relative;
+            z-index: 1;
+            width: 100%;
+            max-width: 760px;
+            padding: 16px 24px 20px;
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(16px);
+            -webkit-backdrop-filter: blur(16px);
+            border-top: 1px solid rgba(148, 163, 184, 0.08);
+            border-radius: 0 0 16px 16px;
+            margin-bottom: 12px;
+        }
+
+        .input-row {
+            display: flex;
+            gap: 10px;
+            align-items: flex-end;
+        }
+
+        #msg-input {
+            flex: 1;
+            background: rgba(30, 41, 59, 0.6);
+            color: #fff;
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            border-radius: 12px;
+            padding: 12px 16px;
+            font-size: 14px;
+            font-family: 'Inter', sans-serif;
+            outline: none;
+            transition: border-color 0.2s, box-shadow 0.2s;
+            resize: none;
+            min-height: 44px;
+            max-height: 120px;
+        }
+
+        #msg-input:focus {
+            border-color: rgba(99, 102, 241, 0.5);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        #msg-input::placeholder {
+            color: #475569;
+        }
+
+        #send-btn {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: #fff;
+            border: none;
+            border-radius: 12px;
+            width: 44px;
+            height: 44px;
+            font-size: 18px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 2px 8px rgba(99, 102, 241, 0.25);
+        }
+
+        #send-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 16px rgba(99, 102, 241, 0.4);
+        }
+
+        #send-btn:active {
+            transform: translateY(0);
+        }
+
+        #send-btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .footer-info {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            margin-top: 10px;
+        }
+
+        .footer-text {
+            font-size: 10px;
+            color: #334155;
+            letter-spacing: 0.5px;
+        }
+
+        .footer-dot {
+            width: 2px;
+            height: 2px;
+            border-radius: 50%;
+            background: #334155;
+        }
+
+        /* ── Welcome message ── */
+        .welcome-msg {
+            text-align: center;
+            padding: 32px 0 16px;
+        }
+
+        .welcome-avatar {
+            width: 56px;
+            height: 56px;
+            border-radius: 16px;
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 50%, #a78bfa 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+            font-weight: 700;
+            color: #fff;
+            margin: 0 auto 16px;
+            box-shadow: 0 0 30px rgba(99, 102, 241, 0.25);
+        }
+
+        .welcome-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #e2e8f0;
+            margin-bottom: 8px;
+        }
+
+        .welcome-sub {
+            font-size: 13px;
+            color: #64748b;
+            line-height: 1.6;
+        }
+
+        /* ── Error bubble ── */
+        .bubble-error {
+            background: rgba(127, 29, 29, 0.3);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+
+        .bubble-error .label {
+            color: #f87171 !important;
+        }
+    </style>
+</head>
+
+<body>
+    <header>
+        <div class="header-left">
+            <div class="logo">Ω</div>
+            <div>
+                <div class="title">Pocket-Omega</div>
+                <div class="subtitle">Chain of Thought · Go</div>
+            </div>
+        </div>
+        <div class="header-right">
+            <div class="status">
+                <div class="status-dot"></div>
+                <span class="status-text">Online</span>
+            </div>
+            <div class="mode-toggle" id="mode-toggle" onclick="toggleMode()">
+                <div class="switch-track active" id="switch-track">
+                    <div class="switch-thumb"></div>
+                </div>
+                <span class="toggle-label active" id="toggle-label">Agent</span>
+            </div>
+        </div>
+    </header>
+
+    <div id="chat-container">
+        <div class="welcome-msg">
+            <div class="welcome-avatar">Ω</div>
+            <div class="welcome-title">你好！ 👋</div>
+            <div class="welcome-sub">我是 Pocket-Omega，具备思维链推理和工具调用能力的 AI 助手。<br>输入问题开始对话。</div>
+        </div>
+    </div>
+
+    <footer>
+        <div class="input-row">
+            <input type="text" id="msg-input" placeholder="输入你的问题..." autocomplete="off" autofocus>
+            <button id="send-btn" onclick="sendMessage()" title="发送">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="22" y1="2" x2="11" y2="13" />
+                    <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                </svg>
+            </button>
+        </div>
+        <div class="footer-info">
+            <span class="footer-text">Pocket-Omega v0.2</span>
+            <span class="footer-dot"></span>
+            <span class="footer-text">CoT + Tools</span>
+            <span class="footer-dot"></span>
+            <span class="footer-text">Go</span>
+        </div>
+    </footer>
+
+    <script>
+        const chatBox = document.getElementById('chat-container');
+        const input = document.getElementById('msg-input');
+        const btn = document.getElementById('send-btn');
+
+        input.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        function toggleMode() {
+            const track = document.getElementById('switch-track');
+            const label = document.getElementById('toggle-label');
+            const isActive = track.classList.toggle('active');
+            label.classList.toggle('active', isActive);
+            label.textContent = isActive ? 'Agent' : 'Chat';
+        }
+
+        function isAgentMode() {
+            return document.getElementById('switch-track').classList.contains('active');
+        }
+
+        function scrollBottom() {
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            const d = document.createElement('div');
+            d.textContent = text;
+            return d.innerHTML;
+        }
+
+        function addUserMsg(text) {
+            // Remove welcome message if present
+            const welcome = chatBox.querySelector('.welcome-msg');
+            if (welcome) welcome.remove();
+
+            const div = document.createElement('div');
+            div.className = 'msg msg-user';
+            div.innerHTML = '<div class="bubble bubble-user">' + escapeHtml(text) + '</div>';
+            chatBox.appendChild(div);
+            scrollBottom();
+        }
+
+        function addAiMsg(content, isError) {
+            const div = document.createElement('div');
+            div.className = 'msg msg-ai';
+            const bubbleClass = isError ? 'bubble bubble-ai bubble-error' : 'bubble bubble-ai';
+            const labelText = isError ? '错误' : 'Pocket-Omega';
+            div.innerHTML = '<div class="msg-ai-wrapper">' +
+                '<div class="ai-avatar">Ω</div>' +
+                '<div class="' + bubbleClass + '">' +
+                '<div class="label">' + labelText + '</div>' +
+                escapeHtml(content) +
+                '</div></div>';
+            chatBox.appendChild(div);
+            scrollBottom();
+        }
+
+        function addLoading() {
+            const div = document.createElement('div');
+            div.className = 'msg msg-ai';
+            div.id = 'loading-msg';
+            div.innerHTML = '<div class="msg-ai-wrapper">' +
+                '<div class="ai-avatar">Ω</div>' +
+                '<div class="bubble bubble-ai"><div class="loading">' +
+                '<span class="loading-text">思考中</span>' +
+                '<span class="dot"></span><span class="dot"></span><span class="dot"></span>' +
+                '</div></div></div>';
+            chatBox.appendChild(div);
+            scrollBottom();
+        }
+
+        function removeLoading() {
+            const el = document.getElementById('loading-msg');
+            if (el) el.remove();
+        }
+
+        function getOrCreateThinkingBox() {
+            let box = document.getElementById('current-thinking-box');
+            if (!box) {
+                box = document.createElement('details');
+                box.className = 'thinking-box';
+                box.id = 'current-thinking-box';
+                box.setAttribute('open', '');
+                box.innerHTML = '<summary>💭 思考过程 (<span class="thought-count">0</span> 步)</summary>';
+                chatBox.appendChild(box);
+            }
+            return box;
+        }
+
+        function addThoughtStep(thought) {
+            const box = getOrCreateThinkingBox();
+            const countEl = box.querySelector('.thought-count');
+            const currentCount = parseInt(countEl.textContent) + 1;
+            countEl.textContent = currentCount;
+
+            let stepHtml = '<div class="thought-step">' +
+                '<div class="step-title">Thought ' + thought.thought_number + '</div>' +
+                '<pre>' + escapeHtml(thought.current_thinking) + '</pre>';
+            if (thought.plan_text) {
+                stepHtml += '<details><summary>计划状态</summary>' +
+                    '<pre>' + escapeHtml(thought.plan_text) + '</pre></details>';
+            }
+            stepHtml += '</div>';
+
+            const stepDiv = document.createElement('div');
+            stepDiv.innerHTML = stepHtml;
+            box.appendChild(stepDiv.firstElementChild);
+            scrollBottom();
+        }
+
+        function finalizeThinkingBox() {
+            const box = document.getElementById('current-thinking-box');
+            if (box) {
+                box.removeAttribute('open');
+                box.removeAttribute('id');
+            }
+        }
+
+        function getOrCreateAgentBox() {
+            let box = document.getElementById('current-agent-box');
+            if (!box) {
+                box = document.createElement('details');
+                box.className = 'thinking-box';
+                box.id = 'current-agent-box';
+                box.setAttribute('open', '');
+                box.innerHTML = '<summary>🛠️ Agent 执行过程 (<span class="step-count">0</span> 步)</summary>';
+                chatBox.appendChild(box);
+            }
+            return box;
+        }
+
+        function addAgentStep(step) {
+            const box = getOrCreateAgentBox();
+            const countEl = box.querySelector('.step-count');
+            countEl.textContent = parseInt(countEl.textContent) + 1;
+
+            let icon = '🤔', label = '决策', content = step.input || step.output || '';
+
+            if (step.type === 'decide') {
+                icon = '🧭';
+                label = '决策 → ' + step.action;
+                content = step.input;
+            } else if (step.type === 'tool') {
+                icon = '🔧';
+                label = '工具: ' + step.tool_name;
+                content = step.output;
+            } else if (step.type === 'think') {
+                icon = '💭';
+                label = '推理';
+                content = step.output;
+            }
+
+            const stepDiv = document.createElement('div');
+            stepDiv.className = 'thought-step';
+            stepDiv.innerHTML = '<div class="step-title">' + icon + ' ' + escapeHtml(label) + '</div>' +
+                '<pre>' + escapeHtml(content || '') + '</pre>';
+            box.appendChild(stepDiv);
+            scrollBottom();
+        }
+
+        function finalizeAgentBox() {
+            const box = document.getElementById('current-agent-box');
+            if (box) {
+                box.removeAttribute('open');
+                box.removeAttribute('id');
+            }
+        }
+
+        // ── Streaming bubble helpers ──
+        function getOrCreateStreamBubble() {
+            let el = document.getElementById('stream-bubble');
+            if (!el) {
+                const div = document.createElement('div');
+                div.className = 'msg msg-ai';
+                div.id = 'stream-msg';
+                div.innerHTML = '<div class="msg-ai-wrapper">' +
+                    '<div class="ai-avatar">Ω</div>' +
+                    '<div class="bubble bubble-ai">' +
+                    '<div class="label">Pocket-Omega</div>' +
+                    '<span id="stream-bubble"></span>' +
+                    '</div></div>';
+                chatBox.appendChild(div);
+                el = document.getElementById('stream-bubble');
+            }
+            return el;
+        }
+
+        function appendStreamChunk(text) {
+            const el = getOrCreateStreamBubble();
+            el.textContent += text;
+            scrollBottom();
+        }
+
+        function finalizeStreamBubble(solution) {
+            const msg = document.getElementById('stream-msg');
+            if (msg) {
+                // Replace streaming content with final solution
+                const bubble = msg.querySelector('.bubble-ai');
+                if (bubble) {
+                    bubble.innerHTML = '<div class="label">Pocket-Omega</div>' + escapeHtml(solution);
+                }
+                msg.removeAttribute('id');
+                const streamEl = document.getElementById('stream-bubble');
+                if (streamEl) streamEl.removeAttribute('id');
+            } else {
+                // No streaming happened (short answers), use regular bubble
+                addAiMsg(solution);
+            }
+            scrollBottom();
+        }
+
+        function createSSEParser(onEvent) {
+            let buffer = '';
+            let currentEvent = '';
+            let currentData = '';
+
+            return function (chunk) {
+                buffer += chunk;
+                const lines = buffer.split('\n');
+                buffer = lines.pop();
+
+                for (const line of lines) {
+                    const trimmed = line.replace(/\r$/, '');
+                    if (trimmed === '') {
+                        if (currentData) {
+                            onEvent(currentEvent || 'message', currentData.trim());
+                            currentEvent = '';
+                            currentData = '';
+                        }
+                    } else if (trimmed.startsWith('event: ')) {
+                        currentEvent = trimmed.slice(7);
+                    } else if (trimmed.startsWith('data: ')) {
+                        currentData += trimmed.slice(6);
+                    }
+                }
+            };
+        }
+
+        async function sendMessage() {
+            const text = input.value.trim();
+            if (!text) return;
+
+            input.value = '';
+            btn.disabled = true;
+            addUserMsg(text);
+            addLoading();
+
+            try {
+                const formData = new FormData();
+                formData.append('message', text);
+
+                const endpoint = isAgentMode() ? '/api/agent' : '/api/chat';
+
+                const resp = await fetch(endpoint, { method: 'POST', body: formData });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+                const reader = resp.body.getReader();
+                const decoder = new TextDecoder();
+
+                const parseSSE = createSSEParser(function (event, data) {
+                    try {
+                        const parsed = JSON.parse(data);
+                        if (event === 'status') {
+                            const textEl = document.querySelector('.loading-text');
+                            if (textEl) textEl.textContent = parsed.message || '思考中';
+                        } else if (event === 'thought') {
+                            removeLoading();
+                            addThoughtStep(parsed);
+                        } else if (event === 'step' || event === 'tool') {
+                            removeLoading();
+                            addAgentStep(parsed);
+                        } else if (event === 'chunk') {
+                            removeLoading();
+                            appendStreamChunk(parsed.text || '');
+                        } else if (event === 'done') {
+                            removeLoading();
+                            finalizeThinkingBox();
+                            finalizeAgentBox();
+                            finalizeStreamBubble(parsed.solution || '抱歉，未能生成回答。');
+                        }
+                    } catch (e) {
+                        console.error('SSE parse error:', e, data);
+                    }
+                });
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    parseSSE(decoder.decode(value, { stream: true }));
+                }
+
+            } catch (err) {
+                removeLoading();
+                addAiMsg('请求失败: ' + err.message, true);
+            } finally {
+                btn.disabled = false;
+                input.focus();
+            }
+        }
+    </script>
+</body>
+
+</html>
