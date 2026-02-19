@@ -16,9 +16,10 @@ type Config struct {
 	Model        string   // Model name (default: gpt-4o)
 	Temperature  *float32 // Response creativity 0.0-2.0 (nil = API default)
 	MaxTokens    int      // Max tokens in response, 0 = no limit
-	MaxRetries   int      // HTTP-level retry for transient errors only (default: 1)
-	ThinkingMode string   // "auto", "native", or "app" (default: "auto")
-	ToolCallMode string   // "auto", "fc", or "yaml" (default: "auto")
+	MaxRetries      int    // HTTP-level retry for transient errors only (default: 1)
+	ThinkingMode    string // "auto", "native", or "app" (default: "auto")
+	ToolCallMode    string // "auto", "fc", or "yaml" (default: "auto")
+	ContextWindow   int    // context window in tokens (0 = auto-detect from model name)
 }
 
 // NewConfigFromEnv creates Config from environment variables.
@@ -31,8 +32,9 @@ func NewConfigFromEnv() (*Config, error) {
 		Temperature:  getEnvFloat32Ptr("LLM_TEMPERATURE"),
 		MaxTokens:    getEnvIntOrDefault("LLM_MAX_TOKENS", 0),
 		MaxRetries:   getEnvIntOrDefault("LLM_MAX_RETRIES", 1),
-		ThinkingMode: getEnvOrDefault("LLM_THINKING_MODE", "auto"),
-		ToolCallMode: getEnvOrDefault("LLM_TOOL_CALL_MODE", "auto"),
+		ThinkingMode:  getEnvOrDefault("LLM_THINKING_MODE", "auto"),
+		ToolCallMode:  getEnvOrDefault("LLM_TOOL_CALL_MODE", "auto"),
+		ContextWindow: getEnvIntOrDefault("LLM_CONTEXT_WINDOW", 0),
 	}
 
 	if err := config.Validate(); err != nil {
@@ -93,6 +95,21 @@ func (c *Config) ResolveToolCallMode() string {
 	}
 	log.Printf("[Config] Model %q does not support FC, using yaml mode", c.Model)
 	return "yaml"
+}
+
+// ResolveContextWindow returns the effective context window in tokens.
+// Priority: explicit LLM_CONTEXT_WINDOW > auto-detect from model name > 32K safe default.
+func (c *Config) ResolveContextWindow() int {
+	if c.ContextWindow > 0 {
+		return c.ContextWindow
+	}
+	if w := llm.GetContextWindow(c.Model); w > 0 {
+		log.Printf("[Config] Auto-detected context window %d tokens for model %q", w, c.Model)
+		return w
+	}
+	const defaultContextWindow = 32_000
+	log.Printf("[Config] Unknown model %q, using default context window %d tokens", c.Model, defaultContextWindow)
+	return defaultContextWindow
 }
 
 func getEnvOrDefault(key, defaultValue string) string {

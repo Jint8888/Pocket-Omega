@@ -80,6 +80,67 @@ func DetectThinkingCapability(modelName string) ThinkingCapability {
 	}
 }
 
+// GetContextWindow returns the approximate context window in tokens for a known model.
+// Returns 0 for unrecognised models; callers should apply their own safe default.
+// Ordered from most to least specific prefix to avoid short-prefix false matches.
+func GetContextWindow(modelName string) int {
+	lower := strings.ToLower(modelName)
+	parts := strings.Split(lower, "/")
+	baseName := parts[len(parts)-1]
+
+	knownWindows := []struct {
+		prefix string
+		tokens int
+	}{
+		// OpenAI
+		{"gpt-4o", 128_000},
+		{"gpt-4-turbo", 128_000},
+		{"gpt-4", 8_192},
+		{"gpt-3.5-turbo", 16_385},
+		{"o1-mini", 128_000},
+		{"o1-preview", 128_000},
+		{"o1", 200_000},
+		{"o3-mini", 200_000},
+		{"o3", 200_000},
+		{"o4-mini", 200_000},
+		// Anthropic
+		{"claude-3-5", 200_000},
+		{"claude-3-7", 200_000},
+		{"claude-sonnet", 200_000},
+		{"claude-opus", 200_000},
+		{"claude-haiku", 200_000},
+		// DeepSeek
+		{"deepseek-r1", 64_000},
+		{"deepseek-r2", 64_000},
+		{"deepseek-v3", 64_000},
+		{"deepseek-v2", 128_000},
+		{"deepseek", 64_000},
+		// Google Gemini
+		{"gemini-2.5", 1_000_000},
+		{"gemini-2.0", 1_000_000},
+		{"gemini-1.5-pro", 2_000_000},
+		{"gemini-1.5-flash", 1_000_000},
+		// Alibaba Qwen
+		{"qwq", 32_000},
+		{"qwen3", 32_000},
+		{"qwen2.5", 128_000},
+		{"qwen2", 128_000},
+		// Moonshot Kimi
+		{"kimi-k1", 128_000},
+		{"k1.5", 128_000},
+		// Zhipu GLM
+		{"glm-z1", 128_000},
+		{"glm-4", 128_000},
+	}
+
+	for _, kw := range knownWindows {
+		if strings.HasPrefix(baseName, kw.prefix) {
+			return kw.tokens
+		}
+	}
+	return 0 // unknown model — caller should apply a safe default
+}
+
 // DetectToolCallingCapability determines if a model supports Function Calling
 // based on a blacklist approach: most modern models support FC, so we only
 // exclude known unsupported ones.

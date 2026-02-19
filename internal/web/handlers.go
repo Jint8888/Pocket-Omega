@@ -231,20 +231,22 @@ type AgentHandler struct {
 	toolRegistry *tool.Registry
 	workspaceDir string
 	execLogger   *agent.ExecLogger
-	thinkingMode string
-	toolCallMode string
+	thinkingMode        string
+	toolCallMode        string
+	contextWindowTokens int
 }
 
 // NewAgentHandler creates a new agent handler.
-func NewAgentHandler(provider llm.LLMProvider, registry *tool.Registry, workspaceDir string, execLogger *agent.ExecLogger, thinkingMode string, toolCallMode string) *AgentHandler {
+func NewAgentHandler(provider llm.LLMProvider, registry *tool.Registry, workspaceDir string, execLogger *agent.ExecLogger, thinkingMode string, toolCallMode string, contextWindowTokens int) *AgentHandler {
 	return &AgentHandler{
-		llmProvider:  provider,
-		agentFlow:    agent.BuildAgentFlow(provider, registry, thinkingMode),
-		toolRegistry: registry,
-		workspaceDir: workspaceDir,
-		execLogger:   execLogger,
-		thinkingMode: thinkingMode,
-		toolCallMode: toolCallMode,
+		llmProvider:         provider,
+		agentFlow:           agent.BuildAgentFlow(provider, registry, thinkingMode),
+		toolRegistry:        registry,
+		workspaceDir:        workspaceDir,
+		execLogger:          execLogger,
+		thinkingMode:        thinkingMode,
+		toolCallMode:        toolCallMode,
+		contextWindowTokens: contextWindowTokens,
 	}
 }
 
@@ -288,11 +290,12 @@ func (h *AgentHandler) HandleAgent(w http.ResponseWriter, r *http.Request) {
 
 	// Build agent state with SSE callback
 	state := &agent.AgentState{
-		Problem:      userMsg,
-		WorkspaceDir: h.workspaceDir,
-		ToolRegistry: h.toolRegistry,
-		ThinkingMode: h.thinkingMode,
-		ToolCallMode: h.toolCallMode,
+		Problem:             userMsg,
+		WorkspaceDir:        h.workspaceDir,
+		ToolRegistry:        h.toolRegistry,
+		ThinkingMode:        h.thinkingMode,
+		ToolCallMode:        h.toolCallMode,
+		ContextWindowTokens: h.contextWindowTokens,
 		OnStepComplete: func(step agent.StepRecord) {
 			// Write to execution log
 			if h.execLogger != nil {

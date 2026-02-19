@@ -26,7 +26,7 @@ func NewDecideNode(provider llm.LLMProvider) *DecideNode {
 
 // Prep reads the current AgentState and builds context for LLM decision.
 func (n *DecideNode) Prep(state *AgentState) []DecidePrep {
-	stepSummary := buildStepSummary(state.StepHistory)
+	stepSummary := buildStepSummary(state.StepHistory, state.ContextWindowTokens)
 
 	// Only compute what's needed for the selected tool-call mode.
 	var toolsPrompt string
@@ -396,7 +396,29 @@ answer: |                 # action=answer 时
 // Older tool steps are compressed to a one-line metadata summary.
 const recentWindowSize = 3
 
-func buildStepSummary(steps []StepRecord) string {
+// charsPerToken is the approximate character-to-token ratio for mixed Chinese/English.
+// Chinese text averages ~1.5 chars/token; ASCII text averages ~4 chars/token.
+// 2 is a conservative middle ground that avoids underestimating token cost.
+const charsPerToken = 2
+
+// perStepOutputBudget computes the max characters per recent tool step in the decision
+// prompt. Allocates toolOutputBudgetPct% of the context window to tool outputs and
+// divides evenly across recentWindowSize steps.
+// Falls back to 8000 when contextWindowTokens is 0 (unconfigured), preserving
+// existing behaviour.
+func perStepOutputBudget(contextWindowTokens int) int {
+	if contextWindowTokens <= 0 {
+		return 8000 // backward-compatible default
+	}
+	const toolOutputBudgetPct = 40 // percent of context window reserved for tool outputs
+	budget := contextWindowTokens * charsPerToken * toolOutputBudgetPct / 100 / recentWindowSize
+	if budget < 1000 {
+		budget = 1000 // floor: keep outputs useful even on tiny context windows
+	}
+	return budget
+}
+
+func buildStepSummary(steps []StepRecord, contextWindowTokens int) string {
 	if len(steps) == 0 {
 		return ""
 	}
@@ -419,8 +441,8 @@ func buildStepSummary(steps []StepRecord) string {
 			sb.WriteString(fmt.Sprintf("  步骤 %d [决策]: %s → %s\n", s.StepNumber, s.Action, s.Input))
 		case "tool":
 			if toolIdx >= fullOutputThreshold {
-				// Recent tool step — keep full output
-				sb.WriteString(fmt.Sprintf("  步骤 %d [工具 %s]: %s\n", s.StepNumber, s.ToolName, truncate(s.Output, 8000)))
+				// Recent tool step — keep full output within model-aware budget
+				sb.WriteString(fmt.Sprintf("  步骤 %d [工具 %s]: %s\n", s.StepNumber, s.ToolName, truncate(s.Output, perStepOutputBudget(contextWindowTokens))))
 			} else {
 				// Old tool step — one-line summary
 				sb.WriteString(fmt.Sprintf("  步骤 %d [工具 %s]: 已执行 (%s)，输出 %d bytes\n", s.StepNumber, s.ToolName, truncate(s.Input, 80), len(s.Output)))

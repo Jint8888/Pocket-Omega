@@ -87,9 +87,11 @@ func main() {
 	chatHandler := web.NewChatHandler(llmClient, 3)
 	thinkingMode := llmClient.GetConfig().ResolveThinkingMode()
 	toolCallMode := llmClient.GetConfig().ToolCallMode // raw value: "auto", "fc", or "yaml"
-	agentHandler := web.NewAgentHandler(llmClient, registry, workspaceDir, execLogger, thinkingMode, toolCallMode)
+	contextWindow := llmClient.GetConfig().ResolveContextWindow()
+	agentHandler := web.NewAgentHandler(llmClient, registry, workspaceDir, execLogger, thinkingMode, toolCallMode, contextWindow)
 	fmt.Printf("🧠 Thinking: %s\n", thinkingMode)
 	fmt.Printf("🔧 ToolCall: %s (resolved: %s)\n", toolCallMode, llmClient.GetConfig().ResolveToolCallMode())
+	fmt.Printf("📐 ContextWindow: %d tokens\n", contextWindow)
 
 	// Create and start web server
 	server, err := web.NewServer(chatHandler, agentHandler)

@@ -9,6 +9,11 @@ import (
 	"time"
 )
 
+// execLogOutputMaxRunes is the maximum rune count for a single tool output written
+// to the execution log file. This is a readability limit for the markdown file,
+// unrelated to the LLM context window budget.
+const execLogOutputMaxRunes = 4000
+
 // ExecLogger writes agent execution steps to a markdown file for debugging.
 // Thread-safe. The log file is truncated on creation.
 type ExecLogger struct {
@@ -63,10 +68,10 @@ func (l *ExecLogger) LogStep(step StepRecord) {
 		}
 		if step.Output != "" {
 			output := step.Output
-			// Truncate very long outputs
+			// Truncate very long outputs for log readability
 			runes := []rune(output)
-			if len(runes) > 4000 {
-				output = string(runes[:4000]) + "\n... (truncated)"
+			if len(runes) > execLogOutputMaxRunes {
+				output = string(runes[:execLogOutputMaxRunes]) + "\n... (truncated)"
 			}
 			l.writef("\n<details>\n<summary>执行结果</summary>\n\n```\n%s\n```\n\n</details>\n\n", output)
 		}

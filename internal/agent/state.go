@@ -17,8 +17,9 @@ type AgentState struct {
 
 	Solution string // Final answer
 
-	ThinkingMode string // "native" or "app" — controls DecideNode prompt options
-	ToolCallMode string // "auto", "fc", or "yaml" — may be raw unresolved value
+	ThinkingMode        string // "native" or "app" — controls DecideNode prompt options
+	ToolCallMode        string // "auto", "fc", or "yaml" — may be raw unresolved value
+	ContextWindowTokens int    // model context window in tokens; 0 = use safe fallback
 
 	// Transient field: DecideNode writes, ToolNode/ThinkNode reads.
 	// Solves node-to-node state passing.
