@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	maxRequestBody = 1 << 20         // 1MB max request body
-	chatTimeout    = 5 * time.Minute // global timeout for chat flow
-	agentTimeout   = 5 * time.Minute // global timeout for agent flow
+	maxRequestBody  = 1 << 20         // 1MB max request body
+	maxMessageRunes = 8000            // max user message length in runes
+	chatTimeout     = 5 * time.Minute // global timeout for chat flow
+	agentTimeout    = 5 * time.Minute // global timeout for agent flow
 )
 
 // ── SSE Writer ──
@@ -175,6 +176,10 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Empty message", http.StatusBadRequest)
 		return
 	}
+	if len([]rune(userMsg)) > maxMessageRunes {
+		http.Error(w, "Message too long", http.StatusRequestEntityTooLarge)
+		return
+	}
 
 	log.Printf("[Chat] Received: %s", userMsg)
 
@@ -227,10 +232,11 @@ type AgentHandler struct {
 	workspaceDir string
 	execLogger   *agent.ExecLogger
 	thinkingMode string
+	toolCallMode string
 }
 
 // NewAgentHandler creates a new agent handler.
-func NewAgentHandler(provider llm.LLMProvider, registry *tool.Registry, workspaceDir string, execLogger *agent.ExecLogger, thinkingMode string) *AgentHandler {
+func NewAgentHandler(provider llm.LLMProvider, registry *tool.Registry, workspaceDir string, execLogger *agent.ExecLogger, thinkingMode string, toolCallMode string) *AgentHandler {
 	return &AgentHandler{
 		llmProvider:  provider,
 		agentFlow:    agent.BuildAgentFlow(provider, registry, thinkingMode),
@@ -238,6 +244,7 @@ func NewAgentHandler(provider llm.LLMProvider, registry *tool.Registry, workspac
 		workspaceDir: workspaceDir,
 		execLogger:   execLogger,
 		thinkingMode: thinkingMode,
+		toolCallMode: toolCallMode,
 	}
 }
 
@@ -253,6 +260,10 @@ func (h *AgentHandler) HandleAgent(w http.ResponseWriter, r *http.Request) {
 	userMsg := strings.TrimSpace(r.FormValue("message"))
 	if userMsg == "" {
 		http.Error(w, "Empty message", http.StatusBadRequest)
+		return
+	}
+	if len([]rune(userMsg)) > maxMessageRunes {
+		http.Error(w, "Message too long", http.StatusRequestEntityTooLarge)
 		return
 	}
 
@@ -281,6 +292,7 @@ func (h *AgentHandler) HandleAgent(w http.ResponseWriter, r *http.Request) {
 		WorkspaceDir: h.workspaceDir,
 		ToolRegistry: h.toolRegistry,
 		ThinkingMode: h.thinkingMode,
+		ToolCallMode: h.toolCallMode,
 		OnStepComplete: func(step agent.StepRecord) {
 			// Write to execution log
 			if h.execLogger != nil {

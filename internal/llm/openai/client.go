@@ -2,10 +2,12 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"strings"
 	"time"
 
@@ -38,6 +40,8 @@ func NewClient(config *Config) (*Client, error) {
 	if config.BaseURL != "" {
 		clientConfig.BaseURL = config.BaseURL
 	}
+	// Prevent indefinite hangs when the API is unresponsive
+	clientConfig.HTTPClient = &http.Client{Timeout: 180 * time.Second}
 
 	return &Client{
 		client: openailib.NewClientWithConfig(clientConfig),
@@ -79,6 +83,10 @@ func (c *Client) CallLLM(ctx context.Context, messages []llm.Message) (llm.Messa
 	}
 	if c.config.MaxTokens > 0 {
 		req.MaxTokens = c.config.MaxTokens
+	}
+	// Enable native thinking for supported models
+	if c.config.ResolveThinkingMode() == "native" {
+		req.ReasoningEffort = "medium"
 	}
 
 	// Execute with retries
@@ -149,6 +157,10 @@ func (c *Client) CallLLMStream(ctx context.Context, messages []llm.Message, onCh
 	if c.config.MaxTokens > 0 {
 		req.MaxTokens = c.config.MaxTokens
 	}
+	// Enable native thinking for supported models
+	if c.config.ResolveThinkingMode() == "native" {
+		req.ReasoningEffort = "medium"
+	}
 
 	stream, err := c.client.CreateChatCompletionStream(ctx, req)
 	if err != nil {
@@ -192,6 +204,133 @@ func (c *Client) CallLLMStream(ctx context.Context, messages []llm.Message, onCh
 		Content:          sb.String(),
 		ReasoningContent: reasoningSB.String(),
 	}, nil
+}
+
+// CallLLMWithTools sends messages with tool definitions for Function Calling.
+// Always uses non-streaming mode. The model may return tool_calls or direct text.
+func (c *Client) CallLLMWithTools(ctx context.Context, messages []llm.Message, tools []llm.ToolDefinition) (llm.Message, error) {
+	if len(messages) == 0 {
+		return llm.Message{}, fmt.Errorf("no messages to send")
+	}
+
+	// Convert messages to OpenAI format
+	openaiMsgs := make([]openailib.ChatCompletionMessage, len(messages))
+	for i, msg := range messages {
+		openaiMsgs[i] = openailib.ChatCompletionMessage{
+			Role:    msg.Role,
+			Content: msg.Content,
+		}
+		// Handle tool result messages (role="tool")
+		if msg.Role == llm.RoleTool && msg.ToolCallID != "" {
+			openaiMsgs[i].ToolCallID = msg.ToolCallID
+			if msg.Name != "" {
+				openaiMsgs[i].Name = msg.Name
+			}
+		}
+		// Handle assistant messages with tool calls (role="assistant" + tool_calls)
+		if msg.Role == llm.RoleAssistant && len(msg.ToolCalls) > 0 {
+			openaiTCs := make([]openailib.ToolCall, len(msg.ToolCalls))
+			for j, tc := range msg.ToolCalls {
+				openaiTCs[j] = openailib.ToolCall{
+					ID:   tc.ID,
+					Type: openailib.ToolTypeFunction,
+					Function: openailib.FunctionCall{
+						Name:      tc.Name,
+						Arguments: string(tc.Arguments),
+					},
+				}
+			}
+			openaiMsgs[i].ToolCalls = openaiTCs
+		}
+	}
+
+	// Convert tool definitions to OpenAI format
+	openaiTools := make([]openailib.Tool, len(tools))
+	for i, t := range tools {
+		openaiTools[i] = openailib.Tool{
+			Type: openailib.ToolTypeFunction,
+			Function: &openailib.FunctionDefinition{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.Parameters,
+			},
+		}
+	}
+
+	// Build request (non-streaming)
+	req := openailib.ChatCompletionRequest{
+		Model:    c.config.Model,
+		Messages: openaiMsgs,
+		Tools:    openaiTools,
+	}
+	if c.config.Temperature != nil {
+		req.Temperature = *c.config.Temperature
+	}
+	if c.config.MaxTokens > 0 {
+		req.MaxTokens = c.config.MaxTokens
+	}
+
+	// Execute with retries
+	var resp openailib.ChatCompletionResponse
+	var lastErr error
+
+	for attempt := 0; attempt <= c.config.MaxRetries; attempt++ {
+		resp, lastErr = c.client.CreateChatCompletion(ctx, req)
+		if lastErr == nil {
+			break
+		}
+		if attempt < c.config.MaxRetries {
+			wait := time.Duration(attempt+1) * time.Second
+			log.Printf("[LLM] FC retry %d/%d after %v, error: %v", attempt+1, c.config.MaxRetries, wait, lastErr)
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return llm.Message{}, ctx.Err()
+			}
+		}
+	}
+
+	if lastErr != nil {
+		return llm.Message{}, fmt.Errorf("FC call failed after %d retries: %w", c.config.MaxRetries, lastErr)
+	}
+
+	if len(resp.Choices) == 0 {
+		return llm.Message{}, fmt.Errorf("no choices returned from LLM (FC)")
+	}
+
+	choice := resp.Choices[0].Message
+
+	// Build result message
+	result := llm.Message{
+		Role:             llm.RoleAssistant,
+		Content:          choice.Content,
+		ReasoningContent: choice.ReasoningContent,
+	}
+
+	// Extract tool calls if present
+	if len(choice.ToolCalls) > 0 {
+		result.ToolCalls = make([]llm.ToolCall, len(choice.ToolCalls))
+		for i, tc := range choice.ToolCalls {
+			result.ToolCalls[i] = llm.ToolCall{
+				ID:        tc.ID,
+				Name:      tc.Function.Name,
+				Arguments: json.RawMessage(tc.Function.Arguments),
+			}
+		}
+		names := make([]string, len(result.ToolCalls))
+		for i, tc := range result.ToolCalls {
+			names[i] = tc.Name
+		}
+		log.Printf("[LLM] FC returned %d tool call(s): %s", len(result.ToolCalls), strings.Join(names, ", "))
+	}
+
+	return result, nil
+}
+
+// IsToolCallingEnabled reports whether Function Calling is enabled for this client.
+func (c *Client) IsToolCallingEnabled() bool {
+	mode := c.config.ResolveToolCallMode()
+	return mode == "fc"
 }
 
 // GetName returns the provider name.

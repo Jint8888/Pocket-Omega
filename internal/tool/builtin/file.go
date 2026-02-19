@@ -4,16 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/pocketomega/pocket-omega/internal/tool"
 )
 
 const (
-	maxFileSize  = 1 << 20 // 1MB
-	maxListItems = 100
+	maxFileSize    = 1 << 20 // 1MB — read limit
+	maxWriteSize   = 1 << 20 // 1MB — reject oversized content before filesystem access (C-3)
+	maxListItems   = 100
+	maxFindResults = 50
 )
 
 // ── file_read ──
@@ -53,9 +57,18 @@ func (t *FileReadTool) Execute(_ context.Context, args json.RawMessage) (tool.To
 		return tool.ToolResult{Error: err.Error()}, nil
 	}
 
-	info, err := os.Stat(path)
+	// C-2 fix: open first, then stat — eliminates the TOCTOU race between
+	// os.Stat and os.ReadFile where the underlying file could be replaced
+	// between the two calls.
+	f, err := os.Open(path)
 	if err != nil {
 		return tool.ToolResult{Error: fmt.Sprintf("文件不存在: %s。请确认路径是否正确，或提供完整的绝对路径。", path)}, nil
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return tool.ToolResult{Error: fmt.Sprintf("读取文件信息失败: %v", err)}, nil
 	}
 	if info.IsDir() {
 		return tool.ToolResult{Error: "指定路径是目录，请使用 file_list"}, nil
@@ -64,7 +77,7 @@ func (t *FileReadTool) Execute(_ context.Context, args json.RawMessage) (tool.To
 		return tool.ToolResult{Error: fmt.Sprintf("文件过大 (%d bytes)，最大 %d bytes", info.Size(), maxFileSize)}, nil
 	}
 
-	data, err := os.ReadFile(path)
+	data, err := io.ReadAll(io.LimitReader(f, maxFileSize))
 	if err != nil {
 		return tool.ToolResult{Error: fmt.Sprintf("读取失败: %v", err)}, nil
 	}
@@ -106,6 +119,12 @@ func (t *FileWriteTool) Execute(_ context.Context, args json.RawMessage) (tool.T
 	var a fileWriteArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return tool.ToolResult{Error: fmt.Sprintf("参数解析失败: %v", err)}, nil
+	}
+
+	// C-3 fix: reject oversized content before any filesystem operation,
+	// preventing disk exhaustion from malicious or runaway LLM output.
+	if len(a.Content) > maxWriteSize {
+		return tool.ToolResult{Error: fmt.Sprintf("内容过大 (%d bytes)，最大 %d bytes", len(a.Content), maxWriteSize)}, nil
 	}
 
 	path, err := safeResolvePath(a.Path, t.workspaceDir)
@@ -179,6 +198,9 @@ func (t *FileListTool) Execute(_ context.Context, args json.RawMessage) (tool.To
 			typeStr = "📁"
 		} else if info != nil {
 			sizeStr = fmt.Sprintf(" (%d bytes)", info.Size())
+		} else {
+			// Broken symlink or race: info not available
+			sizeStr = " (size unknown)"
 		}
 
 		sb.WriteString(fmt.Sprintf("%s %s%s\n", typeStr, entry.Name(), sizeStr))
@@ -193,10 +215,6 @@ func (t *FileListTool) Execute(_ context.Context, args json.RawMessage) (tool.To
 }
 
 // ── file_find ──
-
-const (
-	maxFindResults = 50
-)
 
 type FileFindTool struct {
 	workspaceDir string
@@ -226,7 +244,7 @@ var skipDirs = map[string]bool{
 	"vendor": true, "__pycache__": true, ".cache": true,
 }
 
-func (t *FileFindTool) Execute(_ context.Context, args json.RawMessage) (tool.ToolResult, error) {
+func (t *FileFindTool) Execute(ctx context.Context, args json.RawMessage) (tool.ToolResult, error) {
 	var a struct {
 		Pattern string `json:"pattern"`
 	}
@@ -249,7 +267,17 @@ func (t *FileFindTool) Execute(_ context.Context, args json.RawMessage) (tool.To
 	// Check if pattern contains glob characters
 	isGlob := strings.ContainsAny(pattern, "*?[")
 
-	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	// WalkDir's error return is intentionally ignored: errors inside the callback
+	// are used only to signal early termination (limit reached or ctx cancelled).
+	// Filesystem access errors per-entry are skipped in-callback via return nil.
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		// Respect context cancellation for long-running walks
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		if err != nil {
 			return nil // skip inaccessible paths
 		}
@@ -263,7 +291,9 @@ func (t *FileFindTool) Execute(_ context.Context, args json.RawMessage) (tool.To
 		matched := false
 
 		if isGlob {
-			matched, _ = filepath.Match(pattern, name)
+			// H-3 fix: case-insensitive glob — lowercase both sides so that
+			// patterns like "*.Go" match "main.go" on all platforms consistently.
+			matched, _ = filepath.Match(lowerPattern, strings.ToLower(name))
 		} else {
 			matched = strings.Contains(strings.ToLower(name), lowerPattern)
 		}
@@ -305,8 +335,10 @@ func (t *FileFindTool) Execute(_ context.Context, args json.RawMessage) (tool.To
 // ── shared helpers ──
 
 // safeResolvePath resolves a file path and validates it stays within the workspace.
-// Prevents path traversal attacks (e.g. ../../etc/passwd) and prefix collisions
-// (e.g. workspace="C:\project", path="C:\project-evil\attack.txt").
+// Prevents path traversal attacks (e.g. ../../etc/passwd), prefix collisions
+// (e.g. workspace="C:\project", path="C:\project-evil\attack.txt"), and
+// symlink-escape attacks (C-1) where a symlink inside the workspace points
+// to a target outside it.
 func safeResolvePath(path, workspaceDir string) (string, error) {
 	var resolved string
 	if filepath.IsAbs(path) {
@@ -323,17 +355,53 @@ func safeResolvePath(path, workspaceDir string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("无法解析工作目录: %w", err)
 		}
+		// C-1 fix: resolve symlinks on the workspace root itself so that a
+		// workspace dir that is itself a symlink is correctly bounded.
+		realWorkspace, err := filepath.EvalSymlinks(absWorkspace)
+		if err != nil {
+			// Workspace doesn't exist on disk — keep the cleaned abs path
+			realWorkspace = absWorkspace
+		}
+
 		absResolved, err := filepath.Abs(resolved)
 		if err != nil {
 			return "", fmt.Errorf("无法解析目标路径: %w", err)
 		}
+		// C-1 fix: resolve symlinks on the target path so that symlinks
+		// inside the workspace that point outside are caught here.
+		realResolved, _ := resolveExisting(absResolved)
+
+		// Windows: filepath.EvalSymlinks returns canonical casing for existing
+		// paths, but when it falls back to the cleaned abs path the casing may
+		// differ (e.g. "C:\Project" vs "c:\project"). Normalise both sides to
+		// lowercase so that strings.HasPrefix is case-insensitive on Windows.
+		if runtime.GOOS == "windows" {
+			realWorkspace = strings.ToLower(realWorkspace)
+			realResolved = strings.ToLower(realResolved)
+		}
+
 		// Use separator suffix to prevent prefix collision:
 		// "C:\project" vs "C:\project-evil" → must compare "C:\project\"
-		if absResolved != absWorkspace &&
-			!strings.HasPrefix(absResolved, absWorkspace+string(os.PathSeparator)) {
+		if realResolved != realWorkspace &&
+			!strings.HasPrefix(realResolved, realWorkspace+string(os.PathSeparator)) {
 			return "", fmt.Errorf("安全限制: 路径 %q 超出工作目录 %q", path, workspaceDir)
 		}
 	}
 
 	return resolved, nil
+}
+
+// resolveExisting resolves symlinks for an existing path, or for its parent
+// directory if the path itself does not yet exist (e.g. a new file to be written).
+// This prevents symlink-escape attacks where a symlink inside the workspace
+// points to a target outside it.
+func resolveExisting(path string) (string, error) {
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return real, nil
+	}
+	// Path doesn't exist yet: resolve the parent and reassemble with the base name.
+	if real, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+		return filepath.Join(real, filepath.Base(path)), nil
+	}
+	return path, nil
 }

@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 )
 
 // Tool is the unified interface for all tools.
@@ -76,6 +77,9 @@ func BuildSchema(params ...SchemaParam) json.RawMessage {
 		schema["required"] = required
 	}
 
-	data, _ := json.Marshal(schema)
+	data, err := json.Marshal(schema)
+	if err != nil {
+		panic(fmt.Sprintf("BuildSchema: json.Marshal failed: %v", err))
+	}
 	return data
 }

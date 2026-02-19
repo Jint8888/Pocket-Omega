@@ -155,7 +155,7 @@ func (n *ChainOfThoughtNode) Post(state *ThinkingState, prepRes []PrepData, exec
 			log.Printf("[Supervisor] Force accepted after %d retries: %s", MaxSupervisorRetries, reason)
 		}
 
-		fmt.Printf("\n💡 Thought %d (Conclusion):\n  %s\n\nFinal Plan:\n%s\n\n✅ SOLUTION:\n%s\n\n",
+		log.Printf("\n💡 Thought %d (Conclusion):\n  %s\n\nFinal Plan:\n%s\n\n✅ SOLUTION:\n%s\n",
 			thought.ThoughtNumber,
 			strings.ReplaceAll(thinking, "\n", "\n  "),
 			planFormatted,
@@ -164,7 +164,7 @@ func (n *ChainOfThoughtNode) Post(state *ThinkingState, prepRes []PrepData, exec
 		return core.ActionEnd
 	}
 
-	fmt.Printf("\n🤔 Thought %d:\n  %s\n\nPlan:\n%s\n%s\n",
+	log.Printf("\n🤔 Thought %d:\n  %s\n\nPlan:\n%s\n%s\n",
 		thought.ThoughtNumber,
 		strings.ReplaceAll(thinking, "\n", "\n  "),
 		planFormatted,
@@ -249,6 +249,7 @@ func (n *ChainOfThoughtNode) ExecFallback(err error) ThoughtData {
 }
 
 // ExtractYAML extracts YAML content from a ```yaml ... ``` code block.
+// Returns an error only when a code block opening is found but no closing marker.
 func ExtractYAML(content string) (string, error) {
 	// Try ```yaml ... ``` first
 	if idx := strings.Index(content, "```yaml"); idx >= 0 {
@@ -256,6 +257,7 @@ func ExtractYAML(content string) (string, error) {
 		if end := strings.Index(rest, "```"); end >= 0 {
 			return strings.TrimSpace(rest[:end]), nil
 		}
+		return "", fmt.Errorf("unclosed ```yaml code block")
 	}
 	// Try ``` ... ``` as fallback
 	if idx := strings.Index(content, "```"); idx >= 0 {
@@ -263,8 +265,9 @@ func ExtractYAML(content string) (string, error) {
 		if end := strings.Index(rest, "```"); end >= 0 {
 			return strings.TrimSpace(rest[:end]), nil
 		}
+		return "", fmt.Errorf("unclosed ``` code block")
 	}
-	// Try the whole content as YAML
+	// No code block found — try the whole content as YAML
 	return strings.TrimSpace(content), nil
 }
 

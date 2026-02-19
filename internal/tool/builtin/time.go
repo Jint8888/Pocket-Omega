@@ -33,7 +33,9 @@ type timeArgs struct {
 func (t *TimeTool) Execute(_ context.Context, args json.RawMessage) (tool.ToolResult, error) {
 	var a timeArgs
 	if len(args) > 0 {
-		_ = json.Unmarshal(args, &a)
+		if err := json.Unmarshal(args, &a); err != nil {
+			return tool.ToolResult{Error: fmt.Sprintf("参数解析失败: %v", err)}, nil
+		}
 	}
 
 	now := time.Now()
@@ -52,7 +54,10 @@ func (t *TimeTool) Execute(_ context.Context, args json.RawMessage) (tool.ToolRe
 	return tool.ToolResult{Output: output}, nil
 }
 
+// weekdayNames maps time.Weekday (Sunday=0) to Chinese names.
+// Defined at package level to avoid per-call slice allocation.
+var weekdayNames = [7]string{"星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"}
+
 func translateWeekday(w time.Weekday) string {
-	names := []string{"星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"}
-	return names[w]
+	return weekdayNames[w]
 }

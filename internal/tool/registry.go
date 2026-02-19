@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/pocketomega/pocket-omega/internal/llm"
 )
 
 // Registry manages all registered tools with thread-safe access.
@@ -22,10 +24,14 @@ func NewRegistry() *Registry {
 	}
 }
 
-// Register adds a tool to the registry.
+// Register adds a tool to the registry. If a tool with the same name already
+// exists, it is overwritten and a warning is logged.
 func (r *Registry) Register(t Tool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if _, exists := r.tools[t.Name()]; exists {
+		log.Printf("[Registry] WARNING: overwriting existing tool %q", t.Name())
+	}
 	r.tools[t.Name()] = t
 	log.Printf("[Registry] Registered tool: %s", t.Name())
 }
@@ -79,6 +85,21 @@ func (r *Registry) GenerateToolsPrompt() string {
 		}
 	}
 	return sb.String()
+}
+
+// GenerateToolDefinitions creates FC-compatible tool definitions.
+// Used by the FC path in DecideNode. The YAML path uses GenerateToolsPrompt instead.
+func (r *Registry) GenerateToolDefinitions() []llm.ToolDefinition {
+	tools := r.List()
+	defs := make([]llm.ToolDefinition, len(tools))
+	for i, t := range tools {
+		defs[i] = llm.ToolDefinition{
+			Name:        t.Name(),
+			Description: t.Description(),
+			Parameters:  t.InputSchema(),
+		}
+	}
+	return defs
 }
 
 // InitAll initializes all registered tools.

@@ -706,7 +706,6 @@
                 box = document.createElement('details');
                 box.className = 'thinking-box';
                 box.id = 'current-thinking-box';
-                box.setAttribute('open', '');
                 box.innerHTML = '<summary>💭 思考过程 (<span class="thought-count">0</span> 步)</summary>';
                 chatBox.appendChild(box);
             }
@@ -748,7 +747,6 @@
                 box = document.createElement('details');
                 box.className = 'thinking-box';
                 box.id = 'current-agent-box';
-                box.setAttribute('open', '');
                 box.innerHTML = '<summary>🛠️ Agent 执行过程 (<span class="step-count">0</span> 步)</summary>';
                 chatBox.appendChild(box);
             }

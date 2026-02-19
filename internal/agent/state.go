@@ -1,10 +1,14 @@
 package agent
 
 import (
+	"github.com/pocketomega/pocket-omega/internal/llm"
 	"github.com/pocketomega/pocket-omega/internal/tool"
 )
 
 // AgentState is the shared state for the agent decision loop.
+// NOT goroutine-safe: all fields must be accessed from a single goroutine.
+// The current Flow.Run implementation guarantees single-goroutine access.
+// If parallel node execution is introduced in the future, add sync.Mutex protection.
 type AgentState struct {
 	Problem      string         // User's original question
 	WorkspaceDir string         // Working directory for file/shell tools
@@ -14,6 +18,7 @@ type AgentState struct {
 	Solution string // Final answer
 
 	ThinkingMode string // "native" or "app" — controls DecideNode prompt options
+	ToolCallMode string // "auto", "fc", or "yaml" — may be raw unresolved value
 
 	// Transient field: DecideNode writes, ToolNode/ThinkNode reads.
 	// Solves node-to-node state passing.
@@ -27,32 +32,35 @@ type AgentState struct {
 // StepRecord records a single step execution.
 type StepRecord struct {
 	StepNumber int    `json:"step_number"`
-	Type       string `json:"type"`      // "decide", "tool", "think", "answer"
-	Action     string `json:"action"`    // Decision action
-	ToolName   string `json:"tool_name"` // Tool name (when type=tool)
-	Input      string `json:"input"`     // Input content
-	Output     string `json:"output"`    // Output result
+	Type       string `json:"type"`                   // "decide", "tool", "think", "answer"
+	Action     string `json:"action"`                 // Decision action
+	ToolName   string `json:"tool_name"`              // Tool name (when type=tool)
+	Input      string `json:"input"`                  // Input content
+	Output     string `json:"output"`                 // Output result
+	ToolCallID string `json:"tool_call_id,omitempty"` // FC only: correlates with model's tool call
 }
 
 // MaxAgentSteps prevents infinite decision loops.
-const MaxAgentSteps = 16
+const MaxAgentSteps = 24
 
 // ── DecideNode generic types ──
 // BaseNode[AgentState, DecidePrep, Decision]
 
 // DecidePrep is the prepared data for LLM decision-making.
 type DecidePrep struct {
-	Problem      string
-	WorkspaceDir string // Working directory context for LLM
-	StepSummary  string // Summary of previous steps
-	ToolsPrompt  string // Available tools description
-	StepCount    int    // Current step count (for forced termination)
-	ThinkingMode string // "native" or "app"
+	Problem         string
+	WorkspaceDir    string               // Working directory context for LLM
+	StepSummary     string               // Summary of previous steps
+	ToolsPrompt     string               // Available tools description (YAML path)
+	ToolDefinitions []llm.ToolDefinition // Tool definitions (FC path)
+	StepCount       int                  // Current step count (for forced termination)
+	ThinkingMode    string               // "native" or "app"
+	ToolCallMode    string               // "auto", "fc", or "yaml" — may be raw unresolved value
 }
 
-// Decision is the LLM's decision output, parsed from YAML.
-// ToolParams uses map[string]any (YAML-friendly); converted to json.RawMessage
-// via json.Marshal before calling Tool.Execute().
+// Decision is the LLM's decision output.
+// In YAML mode: parsed from YAML text. In FC mode: extracted from tool_calls.
+// ToolParams uses map[string]any; converted to json.RawMessage before calling Tool.Execute().
 type Decision struct {
 	Action     string         `yaml:"action"`      // "tool", "think", "answer"
 	Reason     string         `yaml:"reason"`      // Reasoning for this decision
@@ -60,6 +68,7 @@ type Decision struct {
 	ToolParams map[string]any `yaml:"tool_params"` // YAML-friendly, json.Marshal before tool call
 	Thinking   string         `yaml:"thinking"`    // Used when action=think
 	Answer     string         `yaml:"answer"`      // Used when action=answer
+	ToolCallID string         `yaml:"-"`           // FC only: tool call ID for result correlation
 }
 
 // ── ToolNode generic types ──
@@ -67,15 +76,17 @@ type Decision struct {
 
 // ToolPrep is prepared by reading LastDecision and converting ToolParams.
 type ToolPrep struct {
-	ToolName string
-	Args     []byte // json.RawMessage from json.Marshal(Decision.ToolParams)
+	ToolName   string
+	Args       []byte // json.RawMessage from json.Marshal(Decision.ToolParams)
+	ToolCallID string // FC only: correlates tool result with the model's tool call
 }
 
 // ToolExecResult is the result of executing a tool.
 type ToolExecResult struct {
-	ToolName string
-	Output   string
-	Error    string
+	ToolName   string
+	Output     string
+	Error      string
+	ToolCallID string // FC only: passed through for multi-turn conversation history
 }
 
 // ── ThinkNode generic types ──

@@ -26,6 +26,7 @@ go.work
 # OS
 .DS_Store
 Thumbs.db
+nul
 
 # Build output
 /bin/
@@ -36,3 +37,9 @@ Thumbs.db
 
 # Local docs (not for public repo)
 /docs/
+
+# AI assistant config
+.serena/
+
+# MCP config (may contain server credentials)
+mcp.json

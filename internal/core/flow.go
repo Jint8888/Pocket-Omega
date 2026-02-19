@@ -5,6 +5,11 @@ import (
 	"log"
 )
 
+// maxFlowIterations is an independent safety cap on the number of node
+// transitions per Run call. It guards against misconfigured successor
+// graphs that could bypass application-level step limits (e.g. MaxAgentSteps).
+const maxFlowIterations = 200
+
 // Flow orchestrates the execution of connected workflows using action-based routing.
 // It implements the Workflow interface, allowing flows to be nested.
 type Flow[State any] struct {
@@ -29,7 +34,12 @@ func (f *Flow[State]) Run(ctx context.Context, state *State) Action {
 	}
 
 	var lastAction Action = ActionSuccess
-	for current != nil {
+	for i := 0; current != nil; i++ {
+		if i >= maxFlowIterations {
+			log.Printf("[Flow] Warning: maxFlowIterations (%d) reached, aborting to prevent infinite loop", maxFlowIterations)
+			return ActionFailure
+		}
+
 		// Check context cancellation between node transitions
 		if ctx.Err() != nil {
 			log.Printf("[Flow] Context cancelled: %v", ctx.Err())

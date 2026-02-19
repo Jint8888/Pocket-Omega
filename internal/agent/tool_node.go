@@ -34,8 +34,9 @@ func (n *ToolNodeImpl) Prep(state *AgentState) []ToolPrep {
 	}
 
 	return []ToolPrep{{
-		ToolName: state.LastDecision.ToolName,
-		Args:     argsJSON,
+		ToolName:   state.LastDecision.ToolName,
+		Args:       argsJSON,
+		ToolCallID: state.LastDecision.ToolCallID,
 	}}
 }
 
@@ -44,23 +45,26 @@ func (n *ToolNodeImpl) Exec(ctx context.Context, prep ToolPrep) (ToolExecResult,
 	t, ok := n.registry.Get(prep.ToolName)
 	if !ok {
 		return ToolExecResult{
-			ToolName: prep.ToolName,
-			Error:    fmt.Sprintf("工具 %q 未找到", prep.ToolName),
+			ToolName:   prep.ToolName,
+			Error:      fmt.Sprintf("工具 %q 未找到", prep.ToolName),
+			ToolCallID: prep.ToolCallID,
 		}, nil
 	}
 
 	result, err := t.Execute(ctx, json.RawMessage(prep.Args))
 	if err != nil {
 		return ToolExecResult{
-			ToolName: prep.ToolName,
-			Error:    fmt.Sprintf("执行失败: %v", err),
+			ToolName:   prep.ToolName,
+			Error:      fmt.Sprintf("执行失败: %v", err),
+			ToolCallID: prep.ToolCallID,
 		}, nil // Don't propagate as error; record the failure
 	}
 
 	return ToolExecResult{
-		ToolName: prep.ToolName,
-		Output:   result.Output,
-		Error:    result.Error,
+		ToolName:   prep.ToolName,
+		Output:     result.Output,
+		Error:      result.Error,
+		ToolCallID: prep.ToolCallID,
 	}, nil
 }
 
@@ -80,9 +84,14 @@ func (n *ToolNodeImpl) Post(state *AgentState, prep []ToolPrep, results ...ToolE
 	result := results[0]
 	p := prep[0]
 
+	// Merge output and error — preserve partial output when tools fail
 	output := result.Output
 	if result.Error != "" {
-		output = fmt.Sprintf("错误: %s", result.Error)
+		if output != "" {
+			output = fmt.Sprintf("%s\n\n错误: %s", output, result.Error)
+		} else {
+			output = fmt.Sprintf("错误: %s", result.Error)
+		}
 	}
 
 	step := StepRecord{
@@ -91,6 +100,7 @@ func (n *ToolNodeImpl) Post(state *AgentState, prep []ToolPrep, results ...ToolE
 		ToolName:   p.ToolName,
 		Input:      string(p.Args),
 		Output:     output,
+		ToolCallID: p.ToolCallID,
 	}
 	state.StepHistory = append(state.StepHistory, step)
 

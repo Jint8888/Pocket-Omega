@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -51,8 +52,8 @@ func (l *ExecLogger) LogStep(step StepRecord) {
 	switch step.Type {
 	case "decide":
 		l.writef("**动作**: `%s`  \n", step.Action)
-		if step.Output != "" {
-			l.writef("**理由**: %s\n\n", step.Output)
+		if step.Input != "" {
+			l.writef("**理由**: %s\n\n", step.Input)
 		}
 
 	case "tool":
@@ -98,13 +99,17 @@ func (l *ExecLogger) EndSession(state *AgentState) {
 // Close closes the underlying file.
 func (l *ExecLogger) Close() error {
 	if l.file != nil {
-		return l.file.Close()
+		err := l.file.Close()
+		l.file = nil // prevent accidental double-close
+		return err
 	}
 	return nil
 }
 
 func (l *ExecLogger) writef(format string, args ...interface{}) {
-	fmt.Fprintf(l.file, format, args...)
+	if _, err := fmt.Fprintf(l.file, format, args...); err != nil {
+		log.Printf("[ExecLogger] write failed: %v", err)
+	}
 }
 
 func stepTypeLabel(t string) string {

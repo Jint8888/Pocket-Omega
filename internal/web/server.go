@@ -70,8 +70,20 @@ func (s *Server) Start() error {
 		port = "8080"
 	}
 
-	addr := ":" + port
-	srv := &http.Server{Addr: addr, Handler: s.mux}
+	// Default to localhost to avoid unintentional LAN exposure for a local tool.
+	// Override via WEB_HOST env var for container or multi-host deployments.
+	host := os.Getenv("WEB_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	addr := host + ":" + port
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           s.mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	// Graceful shutdown goroutine
 	go func() {
@@ -88,7 +100,7 @@ func (s *Server) Start() error {
 		}
 	}()
 
-	log.Printf("🌐 Pocket-Omega server running at http://localhost%s", addr)
+	log.Printf("🌐 Pocket-Omega server running at http://%s", addr)
 	err := srv.ListenAndServe()
 	if err == http.ErrServerClosed {
 		log.Println("✅ Server stopped gracefully")

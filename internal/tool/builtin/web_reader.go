@@ -1,6 +1,7 @@
 package builtin
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -81,7 +82,7 @@ func (t *WebReaderTool) Execute(ctx context.Context, args json.RawMessage) (tool
 		return tool.ToolResult{Error: fmt.Sprintf("请求创建失败: %v", err)}, nil
 	}
 	req.Header.Set("User-Agent", webReaderUserAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -90,24 +91,50 @@ func (t *WebReaderTool) Execute(ctx context.Context, args json.RawMessage) (tool
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// Drain body to allow HTTP connection reuse
+		io.Copy(io.Discard, resp.Body)
 		return tool.ToolResult{Error: fmt.Sprintf("HTTP %d: %s", resp.StatusCode, resp.Status)}, nil
 	}
 
 	// Limit body read size
 	limitedReader := io.LimitReader(resp.Body, webReaderMaxBody)
 
-	// Auto-detect charset and transcode to UTF-8
+	// Content-Type dispatch: only parse HTML through extractContent
 	contentType := resp.Header.Get("Content-Type")
-	utf8Reader, err := charset.NewReaderLabel(
-		extractCharset(contentType), limitedReader,
-	)
+	ctLower := strings.ToLower(contentType)
+
+	// Handle non-HTML content types
+	if strings.Contains(ctLower, "application/json") {
+		raw, _ := io.ReadAll(limitedReader)
+		var prettyBuf bytes.Buffer
+		if err := json.Indent(&prettyBuf, raw, "", "  "); err == nil {
+			return tool.ToolResult{Output: truncateContent(prettyBuf.String())}, nil
+		}
+		return tool.ToolResult{Output: truncateContent(string(raw))}, nil
+	}
+	if strings.Contains(ctLower, "text/plain") {
+		raw, _ := io.ReadAll(limitedReader)
+		return tool.ToolResult{Output: truncateContent(string(raw))}, nil
+	}
+	if !strings.Contains(ctLower, "text/html") && !strings.Contains(ctLower, "application/xhtml") {
+		// Unsupported content type (PDF, image, etc.)
+		return tool.ToolResult{Error: fmt.Sprintf("不支持的内容类型: %s", contentType)}, nil
+	}
+
+	// Auto-detect charset and transcode to UTF-8.
+	// charset.NewReader sniffs in priority order:
+	//   1. BOM in the byte stream
+	//   2. <meta charset="..."> / <meta http-equiv="Content-Type" ...> in HTML
+	//   3. charset= parameter in the HTTP Content-Type header
+	//   4. Falls back to UTF-8
+	utf8Reader, err := charset.NewReader(limitedReader, contentType)
 	if err != nil {
-		// Charset conversion failed, fallback to raw reader (assume UTF-8)
+		// Fallback to raw reader (assumed UTF-8) on detection failure
 		utf8Reader = limitedReader
 	}
 
 	// Extract content
-	title, content, err := extractContent(utf8Reader)
+	title, description, content, err := extractContent(utf8Reader)
 	if err != nil {
 		return tool.ToolResult{Error: fmt.Sprintf("内容解析失败: %v", err)}, nil
 	}
@@ -117,46 +144,42 @@ func (t *WebReaderTool) Execute(ctx context.Context, args json.RawMessage) (tool
 	if title != "" {
 		sb.WriteString(fmt.Sprintf("📄 标题：%s\n\n", title))
 	}
+	if description != "" {
+		sb.WriteString(fmt.Sprintf("📝 摘要：%s\n\n", description))
+	}
 	if content == "" {
 		sb.WriteString("⚠️ 未能提取到正文内容。")
 	} else {
-		// Truncate to avoid LLM context overflow
-		runes := []rune(content)
-		if len(runes) > webReaderMaxRunes {
-			content = string(runes[:webReaderMaxRunes]) + "\n\n...(内容截断)"
-		}
-		sb.WriteString(content)
+		sb.WriteString(truncateContent(content))
 	}
 
 	return tool.ToolResult{Output: sb.String()}, nil
 }
 
-// extractCharset extracts the charset value from a Content-Type header.
-// Example: "text/html; charset=gbk" → "gbk"
-// Returns empty string if no charset found (charset.NewReaderLabel will default to UTF-8).
-func extractCharset(contentType string) string {
-	for _, part := range strings.Split(contentType, ";") {
-		part = strings.TrimSpace(part)
-		if strings.HasPrefix(strings.ToLower(part), "charset=") {
-			return strings.TrimPrefix(strings.ToLower(part), "charset=")
-		}
+// truncateContent limits content to webReaderMaxRunes to avoid LLM context overflow.
+func truncateContent(content string) string {
+	runes := []rune(content)
+	if len(runes) > webReaderMaxRunes {
+		return string(runes[:webReaderMaxRunes]) + "\n\n...(内容截断)"
 	}
-	return ""
+	return content
 }
 
-// extractContent parses HTML and extracts the <title> and body text.
-// It skips non-content elements like <script>, <style>, <nav>, <footer>.
-func extractContent(r io.Reader) (title string, content string, err error) {
+// extractContent parses HTML and extracts the <title>, <meta description>, and body text.
+// It skips non-content elements like <script>, <style>, <nav>, <footer>, <form>.
+// <header> is only skipped at page level (depth 0), preserved inside <article>.
+func extractContent(r io.Reader) (title string, description string, content string, err error) {
 	tokenizer := html.NewTokenizer(r)
 
 	var sb strings.Builder
 	var inTitle, inSkip bool
 	skipDepth := 0
+	articleDepth := 0 // tracks nesting inside <article>
 
 	// Tags to skip (non-content areas)
 	skipTags := map[string]bool{
 		"script": true, "style": true, "noscript": true,
-		"nav": true, "footer": true, "header": true,
+		"nav": true, "footer": true, "form": true,
 		"aside": true, "iframe": true, "svg": true,
 	}
 
@@ -164,33 +187,71 @@ func extractContent(r io.Reader) (title string, content string, err error) {
 		tt := tokenizer.Next()
 		switch tt {
 		case html.ErrorToken:
-			err := tokenizer.Err()
+			parseErr := tokenizer.Err()
 			result := collapseBlankLines(strings.TrimSpace(sb.String()))
-			if err == io.EOF {
-				return title, result, nil
+			if parseErr == io.EOF {
+				return title, description, result, nil
 			}
-			return title, result, err
+			return title, description, result, parseErr
 
-		case html.StartTagToken:
-			tn, _ := tokenizer.TagName()
+		case html.StartTagToken, html.SelfClosingTagToken:
+			tn, hasAttr := tokenizer.TagName()
 			tagName := string(tn)
+
+			// Extract <meta name="description"> and <meta property="og:description">
+			if tagName == "meta" && hasAttr && description == "" {
+				var nameVal, propertyVal, contentVal string
+				for {
+					key, val, more := tokenizer.TagAttr()
+					switch string(key) {
+					case "name":
+						nameVal = strings.ToLower(string(val))
+					case "property":
+						propertyVal = strings.ToLower(string(val))
+					case "content":
+						contentVal = string(val)
+					}
+					if !more {
+						break
+					}
+				}
+				// Prefer standard <meta name="description">; fall back to Open Graph og:description
+				if nameVal == "description" && contentVal != "" {
+					description = contentVal
+				} else if propertyVal == "og:description" && contentVal != "" {
+					description = contentVal
+				}
+				continue
+			}
+
+			if tt == html.SelfClosingTagToken {
+				continue
+			}
 
 			if tagName == "title" {
 				inTitle = true
+			}
+			if tagName == "article" {
+				articleDepth++
+			}
+			// Skip <header> only at page level (not inside <article>)
+			if tagName == "header" && articleDepth == 0 {
+				inSkip = true
+				skipDepth++
 			}
 			if skipTags[tagName] {
 				inSkip = true
 				skipDepth++
 			}
-			// Add newline before block-level elements, but avoid consecutive newlines
-			if isBlockElement(tagName) && sb.Len() > 0 {
+			// Add newline before block-level elements, but only outside skip zones
+			if !inSkip && isBlockElement(tagName) && sb.Len() > 0 {
 				s := sb.String()
 				if s[len(s)-1] != '\n' {
 					sb.WriteString("\n")
 				}
 			}
-			// Add cell separator for table cells
-			if (tagName == "td" || tagName == "th") && sb.Len() > 0 {
+			// Add cell separator for table cells (only outside skip zones)
+			if !inSkip && (tagName == "td" || tagName == "th") && sb.Len() > 0 {
 				s := sb.String()
 				if s[len(s)-1] != '\n' && s[len(s)-1] != '|' {
 					sb.WriteString(" | ")
@@ -204,7 +265,12 @@ func extractContent(r io.Reader) (title string, content string, err error) {
 			if tagName == "title" {
 				inTitle = false
 			}
-			if skipTags[tagName] && skipDepth > 0 {
+			if tagName == "article" && articleDepth > 0 {
+				articleDepth--
+			}
+			// Match closing for page-level <header>
+			isPageHeader := tagName == "header" && articleDepth == 0
+			if (skipTags[tagName] || isPageHeader) && skipDepth > 0 {
 				skipDepth--
 				if skipDepth == 0 {
 					inSkip = false
@@ -228,7 +294,7 @@ func extractContent(r io.Reader) (title string, content string, err error) {
 	}
 }
 
-// collapseBlankLines reduces 3+ consecutive newlines down to 2 (one blank line).
+// collapseBlankLines reduces consecutive blank lines down to at most one.
 func collapseBlankLines(s string) string {
 	lines := strings.Split(s, "\n")
 	var result []string

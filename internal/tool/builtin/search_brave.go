@@ -17,15 +17,33 @@ const (
 	braveAPIURL      = "https://api.search.brave.com/res/v1/web/search"
 	braveMaxResults  = 5
 	braveHTTPTimeout = 15 * time.Second
+	braveMaxBody     = 5 << 20 // 5MB success response limit
+	braveErrMaxBody  = 1 << 20 // 1MB error response limit
+	braveErrBodyShow = 200     // max chars of error body shown to caller
 )
 
 // BraveSearchTool provides web search via Brave Search API.
 type BraveSearchTool struct {
-	apiKey string
+	apiKey  string
+	baseURL string       // injectable for tests; defaults to braveAPIURL
+	client  *http.Client // dedicated client to avoid shared http.DefaultClient
+}
+
+// String returns a log-safe representation with the API key omitted,
+// preventing accidental key exposure if the struct is printed.
+func (t *BraveSearchTool) String() string {
+	return fmt.Sprintf("BraveSearchTool{baseURL: %q}", t.baseURL)
 }
 
 func NewBraveSearchTool(apiKey string) *BraveSearchTool {
-	return &BraveSearchTool{apiKey: apiKey}
+	return &BraveSearchTool{
+		apiKey:  apiKey,
+		baseURL: braveAPIURL,
+		// No client-level Timeout: request lifetime is controlled exclusively
+		// via context.WithTimeout in Execute so that callers can impose
+		// shorter deadlines and the two timeouts do not conflict.
+		client: &http.Client{},
+	}
 }
 
 func (t *BraveSearchTool) Name() string { return "brave_search" }
@@ -39,8 +57,15 @@ func (t *BraveSearchTool) InputSchema() json.RawMessage {
 	)
 }
 
-func (t *BraveSearchTool) Init(_ context.Context) error { return nil }
-func (t *BraveSearchTool) Close() error                 { return nil }
+// Init validates that the API key is configured before the tool is used.
+func (t *BraveSearchTool) Init(_ context.Context) error {
+	if t.apiKey == "" {
+		return fmt.Errorf("brave API key 未配置")
+	}
+	return nil
+}
+
+func (t *BraveSearchTool) Close() error { return nil }
 
 // braveResponse is the Brave Search API response (simplified).
 type braveResponse struct {
@@ -56,25 +81,24 @@ type braveResult struct {
 }
 
 func (t *BraveSearchTool) Execute(ctx context.Context, args json.RawMessage) (tool.ToolResult, error) {
-	var a struct {
-		Query string `json:"query"`
-	}
-	if err := json.Unmarshal(args, &a); err != nil {
-		return tool.ToolResult{Error: fmt.Sprintf("参数解析失败: %v", err)}, nil
+	query, err := parseSearchQuery(args)
+	if err != nil {
+		return tool.ToolResult{Error: err.Error()}, nil
 	}
 
-	query := strings.TrimSpace(a.Query)
-	if query == "" {
-		return tool.ToolResult{Error: "搜索关键词不能为空"}, nil
+	// Build request URL using url.Parse to handle any existing query parameters
+	// in baseURL safely (avoids double-? if baseURL already contains a query string).
+	u, err := url.Parse(t.baseURL)
+	if err != nil {
+		return tool.ToolResult{Error: fmt.Sprintf("无效的请求地址: %v", err)}, nil
 	}
+	q := u.Query()
+	q.Set("q", query)
+	q.Set("count", fmt.Sprintf("%d", braveMaxResults))
+	u.RawQuery = q.Encode()
+	requestURL := u.String()
 
-	// Build request URL
-	params := url.Values{}
-	params.Set("q", query)
-	params.Set("count", fmt.Sprintf("%d", braveMaxResults))
-	requestURL := braveAPIURL + "?" + params.Encode()
-
-	// HTTP call with timeout
+	// Single timeout via context so the caller's deadline is always respected.
 	httpCtx, cancel := context.WithTimeout(ctx, braveHTTPTimeout)
 	defer cancel()
 
@@ -83,40 +107,34 @@ func (t *BraveSearchTool) Execute(ctx context.Context, args json.RawMessage) (to
 		return tool.ToolResult{Error: fmt.Sprintf("请求创建失败: %v", err)}, nil
 	}
 	req.Header.Set("Accept", "application/json")
+	// API key is sent via header (not body) per Brave's API design.
 	req.Header.Set("X-Subscription-Token", t.apiKey)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := t.client.Do(req)
 	if err != nil {
 		return tool.ToolResult{Error: fmt.Sprintf("搜索请求失败: %v", err)}, nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return tool.ToolResult{Error: fmt.Sprintf("Brave API 错误 (HTTP %d): %s", resp.StatusCode, string(body))}, nil
+		// LimitReader prevents OOM from unexpectedly large error bodies;
+		// further truncated before returning to avoid exposing internal details.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, braveErrMaxBody))
+		bodyStr := truncateRunes(strings.TrimSpace(string(body)), braveErrBodyShow)
+		return tool.ToolResult{Error: fmt.Sprintf("Brave API 错误 (HTTP %d): %s",
+			resp.StatusCode, bodyStr)}, nil
 	}
 
+	// Decode with LimitReader to prevent OOM from unbounded success response bodies.
 	var braveResp braveResponse
-	if err := json.NewDecoder(resp.Body).Decode(&braveResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, braveMaxBody)).Decode(&braveResp); err != nil {
 		return tool.ToolResult{Error: fmt.Sprintf("响应解析失败: %v", err)}, nil
 	}
 
-	// Format results
-	results := braveResp.Web.Results
-	if len(results) == 0 {
-		return tool.ToolResult{Output: "未找到相关结果。"}, nil
+	results := make([]searchResult, len(braveResp.Web.Results))
+	for i, r := range braveResp.Web.Results {
+		results[i] = searchResult{Title: r.Title, URL: r.URL, Description: r.Description}
 	}
 
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("🔍 找到 %d 条结果：\n\n", len(results)))
-	for i, r := range results {
-		desc := r.Description
-		runes := []rune(desc)
-		if len(runes) > 300 {
-			desc = string(runes[:300]) + "..."
-		}
-		sb.WriteString(fmt.Sprintf("[%d] %s\n    %s\n    %s\n\n", i+1, r.Title, r.URL, desc))
-	}
-
-	return tool.ToolResult{Output: sb.String()}, nil
+	return tool.ToolResult{Output: formatSearchResults(results)}, nil
 }

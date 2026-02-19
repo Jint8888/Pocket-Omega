@@ -52,3 +52,41 @@ func TestDetectThinkingCapability(t *testing.T) {
 		})
 	}
 }
+
+func TestDetectToolCallingCapability(t *testing.T) {
+	tests := []struct {
+		name        string
+		modelName   string
+		wantSupport bool
+	}{
+		// Blacklisted models (no FC)
+		{"o1-mini blocked", "o1-mini", false},
+		{"o1-preview blocked", "o1-preview", false},
+
+		// Supported models (most modern models)
+		{"GPT-4o", "gpt-4o", true},
+		{"GPT-4.1", "gpt-4.1", true},
+		{"Kimi K2.5", "kimi-k2.5-0828", true},
+		{"GLM-5", "glm-5", true},
+		{"DeepSeek-V3", "deepseek-chat", true},
+		{"DeepSeek-V3 via SiliconFlow", "Pro/deepseek-ai/DeepSeek-V3.2", true},
+		{"Claude Sonnet 4", "claude-sonnet-4-20250514", true},
+		{"Qwen 2.5", "qwen-2.5-72b-instruct", true},
+
+		// Edge cases
+		{"empty model name", "", true},
+		{"o1 (not o1-mini/preview)", "o1", true},
+		{"o3-mini", "o3-mini", true},
+		{"o1-mini-turbo (hypothetical future variant)", "o1-mini-turbo", true}, // exact match: should NOT be blocked
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DetectToolCallingCapability(tt.modelName)
+			if got != tt.wantSupport {
+				t.Errorf("DetectToolCallingCapability(%q) = %v, want %v",
+					tt.modelName, got, tt.wantSupport)
+			}
+		})
+	}
+}

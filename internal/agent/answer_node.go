@@ -13,7 +13,7 @@ import (
 
 // directAnswerMaxRunes is the maximum rune length for answers that pass
 // through without an extra LLM synthesis call.
-const directAnswerMaxRunes = 200
+const directAnswerMaxRunes = 500
 
 // AnswerNodeImpl implements BaseNode[AgentState, AnswerPrep, AnswerResult].
 // It generates the final answer from all accumulated context.
@@ -28,9 +28,20 @@ func NewAnswerNode(provider llm.LLMProvider) *AnswerNodeImpl {
 // Prep aggregates all step context for answer generation.
 func (n *AnswerNodeImpl) Prep(state *AgentState) []AnswerPrep {
 	fullContext := buildFullContext(state)
+	hasTools := hasToolSteps(state)
 
-	// If the last decision already has a draft answer, include it as a hint
-	// but always provide the full tool context so the synthesis LLM can verify
+	// Simple direct answer: no tools used, LLM gave a direct response
+	// Pass it through cleanly without "[初步分析]" wrapper
+	if state.LastDecision != nil && state.LastDecision.Answer != "" && !hasTools {
+		return []AnswerPrep{{
+			Problem:     state.Problem,
+			FullContext: state.LastDecision.Answer,
+			HasToolUse:  false,
+			StreamChunk: state.OnStreamChunk,
+		}}
+	}
+
+	// Tool-based answer: include draft answer as hint alongside full tool context
 	if state.LastDecision != nil && state.LastDecision.Answer != "" {
 		fullContext = fmt.Sprintf("[初步分析]:\n%s\n\n%s", state.LastDecision.Answer, fullContext)
 	}
@@ -38,7 +49,7 @@ func (n *AnswerNodeImpl) Prep(state *AgentState) []AnswerPrep {
 	return []AnswerPrep{{
 		Problem:     state.Problem,
 		FullContext: fullContext,
-		HasToolUse:  hasToolSteps(state),
+		HasToolUse:  hasTools,
 		StreamChunk: state.OnStreamChunk,
 	}}
 }
@@ -114,8 +125,9 @@ func buildFullContext(state *AgentState) string {
 		case "think":
 			sb.WriteString(fmt.Sprintf("[分析推理]:\n%s\n\n", s.Output))
 		case "decide":
-			// Include decision context
-			if s.Input != "" {
+			// Only include tool-routing decisions, skip "answer" decisions
+			// to avoid leaking internal reasoning into the final output
+			if s.Input != "" && s.Action != "answer" {
 				sb.WriteString(fmt.Sprintf("[决策 → %s]: %s\n", s.Action, s.Input))
 			}
 		}
