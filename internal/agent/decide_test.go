@@ -268,7 +268,7 @@ func TestExecWithFC_ToolCallReturned(t *testing.T) {
 		supportsFC: true,
 	}
 
-	node := NewDecideNode(mock)
+	node := NewDecideNode(mock, nil)
 	prep := DecidePrep{
 		Problem:      "search for golang",
 		ToolCallMode: "fc",
@@ -305,7 +305,7 @@ func TestExecWithFC_DirectAnswer(t *testing.T) {
 		supportsFC: true,
 	}
 
-	node := NewDecideNode(mock)
+	node := NewDecideNode(mock, nil)
 	prep := DecidePrep{
 		Problem:      "what is 6*7",
 		ToolCallMode: "fc",
@@ -332,7 +332,7 @@ func TestExecWithFC_EmptyResponse(t *testing.T) {
 		supportsFC: true,
 	}
 
-	node := NewDecideNode(mock)
+	node := NewDecideNode(mock, nil)
 	prep := DecidePrep{
 		Problem:      "hello",
 		ToolCallMode: "fc",
@@ -356,7 +356,7 @@ func TestDecideNodeExec_AutoFallbackToYAML(t *testing.T) {
 		supportsFC: true,
 	}
 
-	node := NewDecideNode(mock)
+	node := NewDecideNode(mock, nil)
 	prep := DecidePrep{
 		Problem:      "test fallback",
 		ToolCallMode: "auto", // auto mode — should fallback
@@ -378,7 +378,7 @@ func TestDecideNodeExec_ForcedFCNoFallback(t *testing.T) {
 		supportsFC:          true,
 	}
 
-	node := NewDecideNode(mock)
+	node := NewDecideNode(mock, nil)
 	prep := DecidePrep{
 		Problem:      "test forced fc",
 		ToolCallMode: "fc", // forced mode — should NOT fallback
@@ -401,7 +401,7 @@ func TestExecWithFC_InvalidToolParamsJSON(t *testing.T) {
 		supportsFC: true,
 	}
 
-	node := NewDecideNode(mock)
+	node := NewDecideNode(mock, nil)
 	prep := DecidePrep{
 		Problem:      "test invalid json",
 		ToolCallMode: "fc",
@@ -430,7 +430,7 @@ func TestExecWithFC_HallucinatedToolName(t *testing.T) {
 		supportsFC: true,
 	}
 
-	node := NewDecideNode(mock)
+	node := NewDecideNode(mock, nil)
 	prep := DecidePrep{
 		Problem:      "test hallucinated tool",
 		ToolCallMode: "fc",

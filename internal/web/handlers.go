@@ -12,6 +12,8 @@ import (
 	"github.com/pocketomega/pocket-omega/internal/agent"
 	"github.com/pocketomega/pocket-omega/internal/core"
 	"github.com/pocketomega/pocket-omega/internal/llm"
+	"github.com/pocketomega/pocket-omega/internal/prompt"
+	"github.com/pocketomega/pocket-omega/internal/session"
 	"github.com/pocketomega/pocket-omega/internal/thinking"
 	"github.com/pocketomega/pocket-omega/internal/tool"
 )
@@ -72,15 +74,14 @@ func (s *sseWriter) Send(event string, data interface{}) bool {
 
 // ── Shared Solution Formatter ──
 
-// formatSolutionPrompt is the system prompt for the solution formatting step.
-const formatSolutionPrompt = `你是一个答案整理助手。将推理结论整理为清晰、友好的最终回答。
+// formatSolutionPromptDefault is the fallback system prompt for the solution
+// formatting step used when no loader is available or answer_style.md is absent.
+const formatSolutionPromptDefault = `你是一个答案整理助手。将推理结论整理为清晰、友好的最终回答。
 
 ## 风格指南
-- 用 emoji 图标标注不同段落（如 💡🔍📝✅⚠️🎯📌），让内容更生动
 - 步骤/方案用有序列表，要点用无序列表
 - 重点关键词用 **加粗**
 - 代码/命令用代码块
-- 保持自然的对话语气，像一个专业但友善的助手
 - 保持语言与用户一致（中文问用中文答）
 - 不要添加"以下是答案"之类的前缀，直接作答
 - 如果原始结论已足够好，直接保留不要过度修饰
@@ -107,14 +108,37 @@ const formatSolutionPrompt = `你是一个答案整理助手。将推理结论�
 
 ✅ 关键在于利用灯泡的热惰性，将"只能进一次"的两态判断（亮/灭）扩展为三态判断（亮/暗热/暗冷）。`
 
+// buildFormatPrompt assembles the system prompt for the solution formatting step.
+// Uses answer_style.md from loader (L2+L3) when available.
+func buildFormatPrompt(loader *prompt.PromptLoader) string {
+	if loader == nil {
+		return formatSolutionPromptDefault
+	}
+
+	style := loader.Load("answer_style.md")
+	if style == "" {
+		return formatSolutionPromptDefault
+	}
+
+	// L2 style + L3 user rules
+	var sb strings.Builder
+	sb.WriteString("你是一个答案整理助手。将推理结论整理为清晰、友好的最终回答。\n\n")
+	sb.WriteString(style)
+	if rules := loader.LoadUserRules(); rules != "" {
+		sb.WriteString("\n\n## 用户自定义规则\n")
+		sb.WriteString(rules)
+	}
+	return sb.String()
+}
+
 // formatSolution makes a lightweight LLM call to clean and organize
 // a raw conclusion into a well-structured, user-facing answer.
 // Shared by both ChatHandler and AgentHandler.
-func formatSolution(ctx context.Context, provider llm.LLMProvider, problem, rawSolution string) (string, error) {
+func formatSolution(ctx context.Context, provider llm.LLMProvider, loader *prompt.PromptLoader, problem, rawSolution string) (string, error) {
 	userPrompt := fmt.Sprintf("用户问题：%s\n\n原始推理结论：\n%s\n\n请整理为最终答案：", problem, rawSolution)
 
 	resp, err := provider.CallLLM(ctx, []llm.Message{
-		{Role: llm.RoleSystem, Content: formatSolutionPrompt},
+		{Role: llm.RoleSystem, Content: buildFormatPrompt(loader)},
 		{Role: llm.RoleUser, Content: userPrompt},
 	})
 	if err != nil {
@@ -150,15 +174,22 @@ type sseErrorEvent struct {
 
 // ChatHandler handles chat requests and runs the CoT flow.
 type ChatHandler struct {
-	llmProvider llm.LLMProvider
-	maxRetries  int
+	llmProvider         llm.LLMProvider
+	maxRetries          int
+	contextWindowTokens int
+	sessionStore        *session.Store
+	loader              *prompt.PromptLoader
 }
 
 // NewChatHandler creates a new handler with the given LLM provider.
-func NewChatHandler(provider llm.LLMProvider, maxRetries int) *ChatHandler {
+// loader is optional (nil is valid) — falls back to hardcoded defaults.
+func NewChatHandler(provider llm.LLMProvider, maxRetries int, contextWindowTokens int, store *session.Store, loader *prompt.PromptLoader) *ChatHandler {
 	return &ChatHandler{
-		llmProvider: provider,
-		maxRetries:  maxRetries,
+		llmProvider:         provider,
+		maxRetries:          maxRetries,
+		contextWindowTokens: contextWindowTokens,
+		sessionStore:        store,
+		loader:              loader,
 	}
 }
 
@@ -183,6 +214,18 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[Chat] Received: %s", userMsg)
 
+	// Session history lookup
+	sessionID := strings.TrimSpace(r.FormValue("session_id"))
+	var historyMsgs []llm.Message
+	if sessionID != "" && h.sessionStore != nil {
+		turns := h.sessionStore.GetHistory(sessionID)
+		// Allocate 50% of context window (in chars) to chat history.
+		// More generous than Agent's 30% since Chat has no tool output overhead.
+		// When contextWindowTokens is 0 (unknown), budget is 0 (no cap).
+		budget := h.contextWindowTokens * 2 * 50 / 100
+		historyMsgs = session.ToMessages(turns, budget)
+	}
+
 	sse := newSSEWriter(w, r)
 	if sse == nil {
 		return
@@ -195,7 +238,8 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	// Build and run the CoT flow with streaming callback
 	flow := thinking.BuildFlow(h.llmProvider, h.maxRetries)
 	state := &thinking.ThinkingState{
-		Problem: userMsg,
+		Problem:             userMsg,
+		ConversationHistory: historyMsgs,
 		OnThoughtComplete: func(thought thinking.ThoughtData) {
 			sse.Send("thought", sseThoughtEvent{
 				ThoughtNumber:   thought.ThoughtNumber,
@@ -210,7 +254,7 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	if solution == "" {
 		solution = "抱歉，未能生成回答。请重试。"
 	} else {
-		formatted, err := formatSolution(ctx, h.llmProvider, userMsg, solution)
+		formatted, err := formatSolution(ctx, h.llmProvider, h.loader, userMsg, solution)
 		if err != nil {
 			log.Printf("[Format] Formatting failed, using raw solution: %v", err)
 		} else {
@@ -220,33 +264,47 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 
 	sse.Send("done", sseDoneEvent{Solution: solution})
 	log.Printf("[Chat] Done: %d thoughts, solution %d chars", len(state.Thoughts), len(solution))
+
+	// Persist this turn to session history
+	if sessionID != "" && h.sessionStore != nil {
+		h.sessionStore.AppendTurn(sessionID, session.Turn{
+			UserMsg:   userMsg,
+			Assistant: solution,
+			IsAgent:   false,
+		})
+	}
 }
 
 // ── Agent Handler (Phase 2) ──
 
 // AgentHandler handles agent requests with tool usage capability.
 type AgentHandler struct {
-	llmProvider  llm.LLMProvider
-	agentFlow    core.Workflow[agent.AgentState]
-	toolRegistry *tool.Registry
-	workspaceDir string
-	execLogger   *agent.ExecLogger
+	llmProvider         llm.LLMProvider
+	agentFlow           core.Workflow[agent.AgentState]
+	toolRegistry        *tool.Registry
+	workspaceDir        string
+	execLogger          *agent.ExecLogger
 	thinkingMode        string
 	toolCallMode        string
 	contextWindowTokens int
+	sessionStore        *session.Store
+	loader              *prompt.PromptLoader
 }
 
 // NewAgentHandler creates a new agent handler.
-func NewAgentHandler(provider llm.LLMProvider, registry *tool.Registry, workspaceDir string, execLogger *agent.ExecLogger, thinkingMode string, toolCallMode string, contextWindowTokens int) *AgentHandler {
+// loader is optional (nil is valid) — nodes fall back to hardcoded defaults.
+func NewAgentHandler(provider llm.LLMProvider, registry *tool.Registry, workspaceDir string, execLogger *agent.ExecLogger, thinkingMode string, toolCallMode string, contextWindowTokens int, store *session.Store, loader *prompt.PromptLoader) *AgentHandler {
 	return &AgentHandler{
 		llmProvider:         provider,
-		agentFlow:           agent.BuildAgentFlow(provider, registry, thinkingMode),
+		agentFlow:           agent.BuildAgentFlow(provider, registry, thinkingMode, loader),
 		toolRegistry:        registry,
 		workspaceDir:        workspaceDir,
 		execLogger:          execLogger,
 		thinkingMode:        thinkingMode,
 		toolCallMode:        toolCallMode,
 		contextWindowTokens: contextWindowTokens,
+		sessionStore:        store,
+		loader:              loader,
 	}
 }
 
@@ -271,6 +329,16 @@ func (h *AgentHandler) HandleAgent(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[Agent] Received: %s", userMsg)
 
+	// Session history lookup
+	sessionID := strings.TrimSpace(r.FormValue("session_id"))
+	var historyPrefix string
+	if sessionID != "" && h.sessionStore != nil {
+		turns := h.sessionStore.GetHistory(sessionID)
+		// allocate 30% of context window (in chars) to conversation history
+		budget := h.contextWindowTokens * 2 * 30 / 100
+		historyPrefix = session.ToProblemPrefix(turns, budget)
+	}
+
 	sse := newSSEWriter(w, r)
 	if sse == nil {
 		return
@@ -291,6 +359,7 @@ func (h *AgentHandler) HandleAgent(w http.ResponseWriter, r *http.Request) {
 	// Build agent state with SSE callback
 	state := &agent.AgentState{
 		Problem:             userMsg,
+		ConversationHistory: historyPrefix,
 		WorkspaceDir:        h.workspaceDir,
 		ToolRegistry:        h.toolRegistry,
 		ThinkingMode:        h.thinkingMode,
@@ -332,5 +401,14 @@ func (h *AgentHandler) HandleAgent(w http.ResponseWriter, r *http.Request) {
 	// Write execution log summary
 	if h.execLogger != nil {
 		h.execLogger.EndSession(state)
+	}
+
+	// Persist this turn to session history
+	if sessionID != "" && h.sessionStore != nil {
+		h.sessionStore.AppendTurn(sessionID, session.Turn{
+			UserMsg:   userMsg,
+			Assistant: solution,
+			IsAgent:   true,
+		})
 	}
 }

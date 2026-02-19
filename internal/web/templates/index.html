@@ -621,6 +621,15 @@
     </footer>
 
     <script>
+        // Generate or restore session ID for multi-turn conversation memory.
+        // sessionStorage is cleared automatically when the tab closes, matching
+        // the "short-term" semantics described in docs/short-term-context-plan.md.
+        const SESSION_ID = sessionStorage.getItem('omega_session_id') || (() => {
+            const id = crypto.randomUUID()
+            sessionStorage.setItem('omega_session_id', id)
+            return id
+        })()
+
         const chatBox = document.getElementById('chat-container');
         const input = document.getElementById('msg-input');
         const btn = document.getElementById('send-btn');
@@ -872,6 +881,7 @@
             try {
                 const formData = new FormData();
                 formData.append('message', text);
+                formData.append('session_id', SESSION_ID);
 
                 const endpoint = isAgentMode() ? '/api/agent' : '/api/chat';
 

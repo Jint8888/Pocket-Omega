@@ -43,3 +43,6 @@ nul
 
 # MCP config (may contain server credentials)
 mcp.json
+
+# User custom rules (L3 prompt layer — personal data, not for repo)
+rules.md

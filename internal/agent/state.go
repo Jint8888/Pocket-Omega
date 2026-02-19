@@ -20,6 +20,7 @@ type AgentState struct {
 	ThinkingMode        string // "native" or "app" — controls DecideNode prompt options
 	ToolCallMode        string // "auto", "fc", or "yaml" — may be raw unresolved value
 	ContextWindowTokens int    // model context window in tokens; 0 = use safe fallback
+	ConversationHistory string // formatted conversation prefix, populated by Handler layer
 
 	// Transient field: DecideNode writes, ToolNode/ThinkNode reads.
 	// Solves node-to-node state passing.
@@ -49,14 +50,15 @@ const MaxAgentSteps = 24
 
 // DecidePrep is the prepared data for LLM decision-making.
 type DecidePrep struct {
-	Problem         string
-	WorkspaceDir    string               // Working directory context for LLM
-	StepSummary     string               // Summary of previous steps
-	ToolsPrompt     string               // Available tools description (YAML path)
-	ToolDefinitions []llm.ToolDefinition // Tool definitions (FC path)
-	StepCount       int                  // Current step count (for forced termination)
-	ThinkingMode    string               // "native" or "app"
-	ToolCallMode    string               // "auto", "fc", or "yaml" — may be raw unresolved value
+	Problem             string
+	WorkspaceDir        string               // Working directory context for LLM
+	StepSummary         string               // Summary of previous steps
+	ToolsPrompt         string               // Available tools description (YAML path)
+	ToolDefinitions     []llm.ToolDefinition // Tool definitions (FC path)
+	StepCount           int                  // Current step count (for forced termination)
+	ThinkingMode        string               // "native" or "app"
+	ToolCallMode        string               // "auto", "fc", or "yaml" — may be raw unresolved value
+	ConversationHistory string               // formatted conversation prefix from previous turns
 }
 
 // Decision is the LLM's decision output.

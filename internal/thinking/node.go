@@ -60,11 +60,12 @@ func (n *ChainOfThoughtNode) Prep(state *ThinkingState) []PrepData {
 	}
 
 	return []PrepData{{
-		Problem:          state.Problem,
-		ThoughtsText:     thoughtsText,
-		LastPlanText:     lastPlanText,
-		CurrentThoughtNo: state.CurrentThoughtNum,
-		IsFirstThought:   len(state.Thoughts) == 0,
+		Problem:             state.Problem,
+		ConversationHistory: state.ConversationHistory,
+		ThoughtsText:        thoughtsText,
+		LastPlanText:        lastPlanText,
+		CurrentThoughtNo:    state.CurrentThoughtNum,
+		IsFirstThought:      len(state.Thoughts) == 0,
 	}}
 }
 
@@ -72,9 +73,10 @@ func (n *ChainOfThoughtNode) Prep(state *ThinkingState) []PrepData {
 func (n *ChainOfThoughtNode) Exec(ctx context.Context, prep PrepData) (ThoughtData, error) {
 	prompt := buildPrompt(prep)
 
-	resp, err := n.llmProvider.CallLLM(ctx, []llm.Message{
-		{Role: llm.RoleUser, Content: prompt},
-	})
+	messages := make([]llm.Message, 0, len(prep.ConversationHistory)+1)
+	messages = append(messages, prep.ConversationHistory...)
+	messages = append(messages, llm.Message{Role: llm.RoleUser, Content: prompt})
+	resp, err := n.llmProvider.CallLLM(ctx, messages)
 	if err != nil {
 		return ThoughtData{}, fmt.Errorf("LLM call failed: %w", err)
 	}

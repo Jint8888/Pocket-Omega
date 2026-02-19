@@ -9,6 +9,7 @@ import (
 
 	"github.com/pocketomega/pocket-omega/internal/core"
 	"github.com/pocketomega/pocket-omega/internal/llm"
+	"github.com/pocketomega/pocket-omega/internal/prompt"
 )
 
 // directAnswerMaxRunes is the maximum rune length for answers that pass
@@ -19,10 +20,11 @@ const directAnswerMaxRunes = 500
 // It generates the final answer from all accumulated context.
 type AnswerNodeImpl struct {
 	llmProvider llm.LLMProvider
+	loader      *prompt.PromptLoader
 }
 
-func NewAnswerNode(provider llm.LLMProvider) *AnswerNodeImpl {
-	return &AnswerNodeImpl{llmProvider: provider}
+func NewAnswerNode(provider llm.LLMProvider, loader *prompt.PromptLoader) *AnswerNodeImpl {
+	return &AnswerNodeImpl{llmProvider: provider, loader: loader}
 }
 
 // Prep aggregates all step context for answer generation.
@@ -61,13 +63,11 @@ func (n *AnswerNodeImpl) Exec(ctx context.Context, prep AnswerPrep) (AnswerResul
 		return AnswerResult{Answer: prep.FullContext}, nil
 	}
 
-	prompt := fmt.Sprintf("用户问题：%s\n\n以下是收集到的信息和分析：\n%s\n\n请综合以上信息，给出简洁明了的最终回答：", prep.Problem, prep.FullContext)
+	userPrompt := fmt.Sprintf("用户问题：%s\n\n以下是收集到的信息和分析：\n%s\n\n请综合以上信息，给出简洁明了的最终回答：", prep.Problem, prep.FullContext)
 
 	msgs := []llm.Message{
-		{Role: llm.RoleSystem, Content: `你是一个高效的助手。根据收集到的信息直接回答用户问题。
-回答要简洁、准确、有用。用 emoji 标注段落（💡🔍📝✅⚠️），重点关键词用 **加粗**。
-保持语言与用户一致。不要添加"以下是答案"之类的前缀，直接作答。`},
-		{Role: llm.RoleUser, Content: prompt},
+		{Role: llm.RoleSystem, Content: n.buildSystemPrompt()},
+		{Role: llm.RoleUser, Content: userPrompt},
 	}
 
 	// Use streaming when callback is available
@@ -113,6 +113,39 @@ func (n *AnswerNodeImpl) Post(state *AgentState, prep []AnswerPrep, results ...A
 	log.Printf("[AnswerNode] Final answer generated: %s", truncate(state.Solution, 100))
 
 	return core.ActionEnd
+}
+
+// buildSystemPrompt assembles the answer L2 style rules and optional L3 user rules.
+func (n *AnswerNodeImpl) buildSystemPrompt() string {
+	const answerL1Default = "你是一个高效的助手。根据收集到的信息直接回答用户问题。\n根据已有信息直接作答，不要添加\"以下是答案\"之类的前缀。"
+
+	if n.loader == nil {
+		return answerL1Default
+	}
+
+	var sb strings.Builder
+
+	// L2 persona: agent identity (loaded first to establish character)
+	if persona := n.loader.LoadSoul(); persona != "" {
+		sb.WriteString(persona)
+		sb.WriteString("\n\n")
+	} else {
+		// Fallback identity when no persona file
+		sb.WriteString("你是一个高效的助手。根据收集到的信息直接回答用户问题。\n\n")
+	}
+
+	// L2: answer style rules
+	if style := n.loader.Load("answer_style.md"); style != "" {
+		sb.WriteString(style)
+	}
+
+	// L3: user custom rules
+	if rules := n.loader.LoadUserRules(); rules != "" {
+		sb.WriteString("\n\n## 用户自定义规则\n")
+		sb.WriteString(rules)
+	}
+
+	return sb.String()
 }
 
 // buildFullContext creates a comprehensive context from all steps.

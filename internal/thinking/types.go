@@ -1,6 +1,10 @@
 package thinking
 
-import "regexp"
+import (
+	"regexp"
+
+	"github.com/pocketomega/pocket-omega/internal/llm"
+)
 
 // Supervisor constants — invisible quality gate for the CoT chain.
 const (
@@ -23,10 +27,11 @@ var rejectPatterns = []*regexp.Regexp{
 
 // ThinkingState is the shared state for the Chain of Thought flow.
 type ThinkingState struct {
-	Problem           string        `json:"problem"`
-	Thoughts          []ThoughtData `json:"thoughts"`
-	CurrentThoughtNum int           `json:"current_thought_num"`
-	Solution          string        `json:"solution"`
+	Problem             string        `json:"problem"`
+	ConversationHistory []llm.Message `json:"-"` // injected multi-turn history, populated by Handler layer
+	Thoughts            []ThoughtData `json:"thoughts"`
+	CurrentThoughtNum   int           `json:"current_thought_num"`
+	Solution            string        `json:"solution"`
 
 	// OnThoughtComplete is called after each thought step completes.
 	// Used for SSE streaming to push thoughts to the client in real-time.
@@ -55,9 +60,10 @@ type PlanStep struct {
 
 // PrepData holds prepared data for the Exec phase.
 type PrepData struct {
-	Problem          string
-	ThoughtsText     string
-	LastPlanText     string
-	CurrentThoughtNo int
-	IsFirstThought   bool
+	Problem             string
+	ConversationHistory []llm.Message // passed through from ThinkingState
+	ThoughtsText        string
+	LastPlanText        string
+	CurrentThoughtNo    int
+	IsFirstThought      bool
 }

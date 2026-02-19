@@ -3,6 +3,7 @@ package agent
 import (
 	"github.com/pocketomega/pocket-omega/internal/core"
 	"github.com/pocketomega/pocket-omega/internal/llm"
+	"github.com/pocketomega/pocket-omega/internal/prompt"
 	"github.com/pocketomega/pocket-omega/internal/tool"
 )
 
@@ -18,16 +19,18 @@ import (
 //
 //	DecideNode ──┬── ActionTool   → ToolNode   ──→ DecideNode
 //	             └── ActionAnswer → AnswerNode ──→ End
-func BuildAgentFlow(provider llm.LLMProvider, registry *tool.Registry, thinkingMode string) core.Workflow[AgentState] {
+//
+// loader is optional (nil is valid); when nil nodes fall back to hardcoded defaults.
+func BuildAgentFlow(provider llm.LLMProvider, registry *tool.Registry, thinkingMode string, loader *prompt.PromptLoader) core.Workflow[AgentState] {
 	// Create nodes
 	decideNode := core.NewNode[AgentState, DecidePrep, Decision](
-		NewDecideNode(provider), 1,
+		NewDecideNode(provider, loader), 1,
 	)
 	toolNode := core.NewNode[AgentState, ToolPrep, ToolExecResult](
 		NewToolNode(registry), 0,
 	)
 	answerNode := core.NewNode[AgentState, AnswerPrep, AnswerResult](
-		NewAnswerNode(provider), 1,
+		NewAnswerNode(provider, loader), 1,
 	)
 
 	// Wire the decision loop
@@ -37,7 +40,7 @@ func BuildAgentFlow(provider llm.LLMProvider, registry *tool.Registry, thinkingM
 	// Only register ThinkNode in app mode
 	if thinkingMode == "app" {
 		thinkNode := core.NewNode[AgentState, ThinkPrep, ThinkResult](
-			NewThinkNode(provider), 1,
+			NewThinkNode(provider, loader), 1,
 		)
 		decideNode.AddSuccessor(thinkNode, core.ActionThink)
 		thinkNode.AddSuccessor(decideNode) // ActionDefault → DecideNode

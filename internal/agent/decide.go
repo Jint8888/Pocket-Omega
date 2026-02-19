@@ -10,6 +10,7 @@ import (
 
 	"github.com/pocketomega/pocket-omega/internal/core"
 	"github.com/pocketomega/pocket-omega/internal/llm"
+	"github.com/pocketomega/pocket-omega/internal/prompt"
 	"github.com/pocketomega/pocket-omega/internal/thinking"
 	"gopkg.in/yaml.v3"
 )
@@ -18,10 +19,11 @@ import (
 // It acts as the central router in the ReAct loop.
 type DecideNode struct {
 	llmProvider llm.LLMProvider
+	loader      *prompt.PromptLoader
 }
 
-func NewDecideNode(provider llm.LLMProvider) *DecideNode {
-	return &DecideNode{llmProvider: provider}
+func NewDecideNode(provider llm.LLMProvider, loader *prompt.PromptLoader) *DecideNode {
+	return &DecideNode{llmProvider: provider, loader: loader}
 }
 
 // Prep reads the current AgentState and builds context for LLM decision.
@@ -42,14 +44,15 @@ func (n *DecideNode) Prep(state *AgentState) []DecidePrep {
 	}
 
 	return []DecidePrep{{
-		Problem:         state.Problem,
-		WorkspaceDir:    state.WorkspaceDir,
-		StepSummary:     stepSummary,
-		ToolsPrompt:     toolsPrompt,
-		ToolDefinitions: toolDefs,
-		StepCount:       len(state.StepHistory),
-		ThinkingMode:    state.ThinkingMode,
-		ToolCallMode:    state.ToolCallMode,
+		Problem:             state.Problem,
+		WorkspaceDir:        state.WorkspaceDir,
+		StepSummary:         stepSummary,
+		ToolsPrompt:         toolsPrompt,
+		ToolDefinitions:     toolDefs,
+		StepCount:           len(state.StepHistory),
+		ThinkingMode:        state.ThinkingMode,
+		ToolCallMode:        state.ToolCallMode,
+		ConversationHistory: state.ConversationHistory,
 	}}
 }
 
@@ -90,7 +93,7 @@ func (n *DecideNode) execWithFC(ctx context.Context, prep DecidePrep) (Decision,
 	prompt := buildDecidePromptFC(prep)
 
 	resp, err := n.llmProvider.CallLLMWithTools(ctx, []llm.Message{
-		{Role: llm.RoleSystem, Content: decideSystemPromptFC},
+		{Role: llm.RoleSystem, Content: n.buildSystemPrompt("fc")},
 		{Role: llm.RoleUser, Content: prompt},
 	}, prep.ToolDefinitions)
 	if err != nil {
@@ -142,11 +145,11 @@ func (n *DecideNode) execWithFC(ctx context.Context, prep DecidePrep) (Decision,
 
 // execWithYAML uses the original YAML text parsing to extract decisions.
 func (n *DecideNode) execWithYAML(ctx context.Context, prep DecidePrep) (Decision, error) {
-	prompt := buildDecidePrompt(prep)
+	userPrompt := buildDecidePrompt(prep)
 
 	resp, err := n.llmProvider.CallLLM(ctx, []llm.Message{
-		{Role: llm.RoleSystem, Content: getDecideSystemPrompt(prep.ThinkingMode)},
-		{Role: llm.RoleUser, Content: prompt},
+		{Role: llm.RoleSystem, Content: n.buildSystemPrompt(prep.ThinkingMode)},
+		{Role: llm.RoleUser, Content: userPrompt},
 	})
 	if err != nil {
 		return Decision{}, fmt.Errorf("decide LLM call failed: %w", err)
@@ -243,7 +246,91 @@ func (n *DecideNode) ExecFallback(err error) Decision {
 
 // ── Prompt construction ──
 
-// getDecideSystemPrompt returns the appropriate system prompt based on thinking mode.
+// buildSystemPrompt assembles the three-layer system prompt:
+//   - L1: hardcoded tool-call protocol and constraints (varies by mode)
+//   - L2: project behaviour rules from prompts/*.md (decision principles, answer style)
+//   - L3: user custom rules from rules.md (language, domain, style preferences)
+//
+// mode is one of "fc", "native", or anything else (app mode).
+func (n *DecideNode) buildSystemPrompt(mode string) string {
+	var sb strings.Builder
+
+	// L2 persona: agent identity (loaded first to establish character)
+	if n.loader != nil {
+		if persona := n.loader.LoadSoul(); persona != "" {
+			sb.WriteString(persona)
+			sb.WriteString("\n\n")
+		}
+	}
+
+	// L1: hardcoded tool-call protocol (cannot be overridden)
+	sb.WriteString(decideL1Constraint(mode))
+
+	// L2: project behaviour rules (loaded from embed / disk file)
+	if n.loader != nil {
+		if common := n.loader.Load("decide_common.md"); common != "" {
+			sb.WriteString("\n\n")
+			sb.WriteString(common)
+		}
+		if style := n.loader.Load("answer_style.md"); style != "" {
+			sb.WriteString("\n\n")
+			sb.WriteString(style)
+		}
+		if ruleGuide := n.loader.Load("rule_guide.md"); ruleGuide != "" {
+			sb.WriteString("\n\n")
+			sb.WriteString(ruleGuide)
+		}
+	}
+
+	// L3: user custom rules (runtime file, optional)
+	if n.loader != nil {
+		if rules := n.loader.LoadUserRules(); rules != "" {
+			sb.WriteString("\n\n## 用户自定义规则\n")
+			sb.WriteString(rules)
+		}
+	}
+
+	return sb.String()
+}
+
+// decideL1Constraint returns the hardcoded L1 system prompt fragment for DecideNode.
+// These constraints define the tool-call protocol and cannot be overridden by L2/L3.
+func decideL1Constraint(mode string) string {
+	switch mode {
+	case "fc":
+		return decideL1FC
+	case "native":
+		return decideL1Native
+	default: // "app" mode (extended thinking)
+		return decideL1App
+	}
+}
+
+// L1 constraints — hardcoded, not file-overridable.
+// Only the tool-call protocol and action set differ between modes;
+// decision strategy and answer format are intentionally kept in L2 files.
+
+const decideL1Native = `你是一个智能助手，根据用户问题和当前上下文，决定下一步行动。
+
+你可以选择两种行动：
+1. tool — 调用工具获取信息或执行操作
+2. answer — 直接回答用户问题`
+
+const decideL1App = `你是一个智能助手，根据用户问题和当前上下文，决定下一步行动。
+
+你可以选择三种行动：
+1. tool — 调用工具获取信息或执行操作
+2. think — 进行深度推理分析
+3. answer — 直接回答用户问题`
+
+const decideL1FC = `你是一个智能助手，根据用户问题和当前上下文，决定下一步行动。
+
+你有两种选择：
+1. 调用工具 — 通过 function calling 调用合适的工具
+2. 直接回答 — 如果已有足够信息或问题简单，直接用文本回复`
+
+// getDecideSystemPrompt is retained for backward-compatibility in unit tests
+// that do not inject a loader. New code should call buildSystemPrompt instead.
 func getDecideSystemPrompt(thinkingMode string) string {
 	if thinkingMode == "native" {
 		return decideSystemPromptNative
@@ -251,11 +338,7 @@ func getDecideSystemPrompt(thinkingMode string) string {
 	return decideSystemPromptApp
 }
 
-const decideSystemPromptNative = `你是一个智能助手，根据用户问题和当前上下文，决定下一步行动。
-
-你可以选择两种行动：
-1. tool — 调用工具获取信息或执行操作
-2. answer — 直接回答用户问题
+const decideSystemPromptNative = decideL1Native + `
 
 决策原则：
 - 如果问题需要实时信息（时间、文件内容等），使用 tool
@@ -265,20 +348,15 @@ const decideSystemPromptNative = `你是一个智能助手，根据用户问题�
 - 尽可能高效，尽早给出答案
 
 答案格式：
-- 回答时用 emoji 标注段落（💡🔍📝✅⚠️），重点关键词用 **加粗**
-- 保持语言与用户一致，不要添加“以下是答案”之类的前缀，直接作答
+- 重点关键词用 **加粗**
+- 保持语言与用户一致，不要添加"以下是答案"之类的前缀，直接作答
 
 搜索 + 阅读策略：
 - 搜索获取概览后，用 web_reader 深入阅读最相关的页面
 - web_reader 单次只读一个 URL，选择最关键的那个
 - 如果用户直接给了 URL，优先用 web_reader 而非搜索`
 
-const decideSystemPromptApp = `你是一个智能助手，根据用户问题和当前上下文，决定下一步行动。
-
-你可以选择三种行动：
-1. tool — 调用工具获取信息或执行操作
-2. think — 进行深度推理分析
-3. answer — 直接回答用户问题
+const decideSystemPromptApp = decideL1App + `
 
 决策原则：
 - 如果问题需要实时信息（时间、文件内容等），使用 tool
@@ -289,39 +367,22 @@ const decideSystemPromptApp = `你是一个智能助手，根据用户问题和�
 - 尽可能高效，尽早给出答案
 
 答案格式：
-- 回答时用 emoji 标注段落（💡🔍📝✅⚠️），重点关键词用 **加粗**
-- 保持语言与用户一致，不要添加“以下是答案”之类的前缀，直接作答
+- 重点关键词用 **加粗**
+- 保持语言与用户一致，不要添加"以下是答案"之类的前缀，直接作答
 
 搜索 + 阅读策略：
 - 搜索获取概览后，用 web_reader 深入阅读最相关的页面
 - web_reader 单次只读一个 URL，选择最关键的那个
 - 如果用户直接给了 URL，优先用 web_reader 而非搜索`
 
-// FC 专用 system prompt: 无 YAML 格式要求，无 think action
-const decideSystemPromptFC = `你是一个智能助手，根据用户问题和当前上下文，决定下一步行动。
-
-你有两种选择：
-1. 调用工具 — 通过 function calling 调用合适的工具
-2. 直接回答 — 如果已有足够信息或问题简单，直接用文本回复
-
-决策原则：
-- 需要实时信息时，调用工具
-- 已有足够信息时，直接回答
-- 每个工具最多调用 2 次，尽可能高效
-
-搜索 + 阅读策略：
-- 搜索获取概览后，用 web_reader 深入阅读最相关的页面
-- web_reader 单次只读一个 URL，选择最关键的那个
-- 如果用户直接给了 URL，优先用 web_reader 而非搜索
-
-答案格式：
-- 回答时用 emoji 标注段落（💡🔍📝✅⚠️），重点关键词用 **加粗**
-- 保持语言与用户一致，不要添加“以下是答案”之类的前缀，直接作答`
-
 // buildDecidePromptFC builds the user prompt for FC mode (no YAML template).
 func buildDecidePromptFC(prep DecidePrep) string {
 	var sb strings.Builder
 
+	if prep.ConversationHistory != "" {
+		sb.WriteString(prep.ConversationHistory)
+		sb.WriteString("\n[当前问题]\n")
+	}
 	sb.WriteString(fmt.Sprintf("用户问题：%s\n\n", prep.Problem))
 	if prep.WorkspaceDir != "" {
 		sb.WriteString(fmt.Sprintf("当前工作目录：%s\n文件工具的路径相对于此目录。用 \".\" 表示当前目录。\n\n", prep.WorkspaceDir))
@@ -345,6 +406,10 @@ func buildDecidePromptFC(prep DecidePrep) string {
 func buildDecidePrompt(prep DecidePrep) string {
 	var sb strings.Builder
 
+	if prep.ConversationHistory != "" {
+		sb.WriteString(prep.ConversationHistory)
+		sb.WriteString("\n[当前问题]\n")
+	}
 	sb.WriteString(fmt.Sprintf("用户问题：%s\n\n", prep.Problem))
 	if prep.WorkspaceDir != "" {
 		sb.WriteString(fmt.Sprintf("当前工作目录：%s\n文件工具的路径相对于此目录。用 \".\" 表示当前目录。\n\n", prep.WorkspaceDir))
