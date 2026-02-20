@@ -24,6 +24,7 @@ func TestMCPToolAdapter_Name(t *testing.T) {
 				tc.serverName,
 				ToolInfo{Name: tc.toolName},
 				nil, // client not needed for Name()
+				ServerConfig{},
 			)
 			if got := adapter.Name(); got != tc.wantName {
 				t.Errorf("Name() = %q, want %q", got, tc.wantName)
@@ -34,7 +35,7 @@ func TestMCPToolAdapter_Name(t *testing.T) {
 
 func TestMCPToolAdapter_InputSchema_Passthrough(t *testing.T) {
 	schema := json.RawMessage(`{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}`)
-	adapter := NewMCPToolAdapter("svc", ToolInfo{Name: "search", InputSchema: schema}, nil)
+	adapter := NewMCPToolAdapter("svc", ToolInfo{Name: "search", InputSchema: schema}, nil, ServerConfig{})
 
 	got := adapter.InputSchema()
 	if string(got) != string(schema) {
@@ -44,7 +45,7 @@ func TestMCPToolAdapter_InputSchema_Passthrough(t *testing.T) {
 
 func TestMCPToolAdapter_InputSchema_EmptyFallback(t *testing.T) {
 	// When the MCP server provides no schema, we return a valid empty schema.
-	adapter := NewMCPToolAdapter("svc", ToolInfo{Name: "noop"}, nil)
+	adapter := NewMCPToolAdapter("svc", ToolInfo{Name: "noop"}, nil, ServerConfig{})
 	schema := adapter.InputSchema()
 
 	var obj map[string]any
@@ -54,7 +55,7 @@ func TestMCPToolAdapter_InputSchema_EmptyFallback(t *testing.T) {
 }
 
 func TestMCPToolAdapter_Description(t *testing.T) {
-	adapter := NewMCPToolAdapter("svc", ToolInfo{Name: "t", Description: "Does things"}, nil)
+	adapter := NewMCPToolAdapter("svc", ToolInfo{Name: "t", Description: "Does things"}, nil, ServerConfig{})
 	if got := adapter.Description(); got != "Does things" {
 		t.Errorf("Description() = %q", got)
 	}
@@ -62,7 +63,7 @@ func TestMCPToolAdapter_Description(t *testing.T) {
 
 func TestMCPToolAdapter_Execute_InvalidJSON(t *testing.T) {
 	// Invalid JSON args should return a ToolResult.Error, not a Go error.
-	adapter := NewMCPToolAdapter("svc", ToolInfo{Name: "t"}, NewClient(ServerConfig{}))
+	adapter := NewMCPToolAdapter("svc", ToolInfo{Name: "t"}, NewClient(ServerConfig{}), ServerConfig{})
 	result, err := adapter.Execute(context.Background(), json.RawMessage(`{bad json}`))
 	if err != nil {
 		t.Fatalf("Execute returned Go error; want ToolResult.Error: %v", err)
@@ -75,7 +76,7 @@ func TestMCPToolAdapter_Execute_InvalidJSON(t *testing.T) {
 func TestMCPToolAdapter_Execute_NullArgs(t *testing.T) {
 	// "null" args are valid (no-arg tools) — should not panic or error during unmarshal.
 	// Since there's no real server, we expect a connection error, not an unmarshal error.
-	adapter := NewMCPToolAdapter("svc", ToolInfo{Name: "noop"}, NewClient(ServerConfig{}))
+	adapter := NewMCPToolAdapter("svc", ToolInfo{Name: "noop"}, NewClient(ServerConfig{}), ServerConfig{})
 	result, err := adapter.Execute(context.Background(), json.RawMessage(`null`))
 	if err != nil {
 		t.Fatalf("Execute returned Go error: %v", err)
@@ -89,7 +90,7 @@ func TestMCPToolAdapter_Execute_NullArgs(t *testing.T) {
 
 func TestMCPToolAdapter_Init_Close(t *testing.T) {
 	// Init and Close on adapter must always be no-ops.
-	adapter := NewMCPToolAdapter("svc", ToolInfo{Name: "t"}, nil)
+	adapter := NewMCPToolAdapter("svc", ToolInfo{Name: "t"}, nil, ServerConfig{})
 	if err := adapter.Init(context.Background()); err != nil {
 		t.Errorf("Init() error: %v", err)
 	}

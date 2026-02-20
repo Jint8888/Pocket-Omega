@@ -17,6 +17,7 @@ type Config struct {
 	Temperature  *float32 // Response creativity 0.0-2.0 (nil = API default)
 	MaxTokens    int      // Max tokens in response, 0 = no limit
 	MaxRetries      int    // HTTP-level retry for transient errors only (default: 1)
+	HTTPTimeout     int    // HTTP client timeout in seconds (default: 300)
 	ThinkingMode    string // "auto", "native", or "app" (default: "auto")
 	ToolCallMode    string // "auto", "fc", or "yaml" (default: "auto")
 	ContextWindow   int    // context window in tokens (0 = auto-detect from model name)
@@ -26,12 +27,13 @@ type Config struct {
 // Expected env vars: LLM_API_KEY, LLM_BASE_URL, LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_MAX_RETRIES, LLM_THINKING_MODE, LLM_TOOL_CALL_MODE
 func NewConfigFromEnv() (*Config, error) {
 	config := &Config{
-		APIKey:       getEnvOrDefault("LLM_API_KEY", ""),
-		BaseURL:      getEnvOrDefault("LLM_BASE_URL", "https://api.openai.com/v1"),
-		Model:        getEnvOrDefault("LLM_MODEL", "gpt-4o"),
-		Temperature:  getEnvFloat32Ptr("LLM_TEMPERATURE"),
-		MaxTokens:    getEnvIntOrDefault("LLM_MAX_TOKENS", 0),
-		MaxRetries:   getEnvIntOrDefault("LLM_MAX_RETRIES", 1),
+		APIKey:        getEnvOrDefault("LLM_API_KEY", ""),
+		BaseURL:       getEnvOrDefault("LLM_BASE_URL", "https://api.openai.com/v1"),
+		Model:         getEnvOrDefault("LLM_MODEL", "gpt-4o"),
+		Temperature:   getEnvFloat32Ptr("LLM_TEMPERATURE"),
+		MaxTokens:     getEnvIntOrDefault("LLM_MAX_TOKENS", 0),
+		MaxRetries:    getEnvIntOrDefault("LLM_MAX_RETRIES", 1),
+		HTTPTimeout:   getEnvIntOrDefault("LLM_HTTP_TIMEOUT", 300),
 		ThinkingMode:  getEnvOrDefault("LLM_THINKING_MODE", "auto"),
 		ToolCallMode:  getEnvOrDefault("LLM_TOOL_CALL_MODE", "auto"),
 		ContextWindow: getEnvIntOrDefault("LLM_CONTEXT_WINDOW", 0),

@@ -50,18 +50,6 @@ func NewStore(ttl time.Duration, maxTurns int) *Store {
 	return s
 }
 
-// GetOrCreate returns the session for the given ID, creating one if absent.
-func (s *Store) GetOrCreate(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sess, ok := s.sessions[id]
-	if !ok {
-		sess = &Session{ID: id, LastUsed: time.Now()}
-		s.sessions[id] = sess
-	}
-	sess.LastUsed = time.Now()
-}
-
 // AppendTurn adds a completed exchange to the session, enforcing maxTurns.
 // If the session does not yet exist it is created automatically, so callers
 // do not need to call GetOrCreate separately before the first AppendTurn.

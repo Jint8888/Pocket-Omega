@@ -47,11 +47,17 @@ func LoadConfig(path string) (map[string]ServerConfig, error) {
 // The Name field is populated from the map key in mcp.json, not from a JSON field.
 type ServerConfig struct {
 	Name      string   // derived from the map key in mcp.json
-	Transport string   `json:"transport"`           // "stdio" | "sse"
-	Command   string   `json:"command,omitempty"`   // stdio: executable path
-	Args      []string `json:"args,omitempty"`      // stdio: command arguments
-	URL       string   `json:"url,omitempty"`       // sse: base URL
-	Env       []string `json:"env,omitempty"`       // stdio: extra environment variables
+	Transport string   `json:"transport"`         // "stdio" | "sse"
+	Command   string   `json:"command,omitempty"` // stdio: executable path
+	Args      []string `json:"args,omitempty"`    // stdio: command arguments
+	URL       string   `json:"url,omitempty"`     // sse: base URL
+	Env       []string `json:"env,omitempty"`     // stdio: extra environment variables
+	// Lifecycle controls how the stdio process is managed.
+	// "persistent" (default, empty string treated as persistent): process stays alive,
+	// connection is reused across calls.
+	// "per_call": a new process is started for each tool invocation and terminated
+	// immediately after. Suitable for stateless tools where cold-start is acceptable.
+	Lifecycle string `json:"lifecycle,omitempty"` // "persistent" | "per_call"
 }
 
 // ToolInfo captures the metadata of a single tool exposed by an MCP server.

@@ -82,7 +82,10 @@ func (n *DecideNode) Exec(ctx context.Context, prep DecidePrep) (Decision, error
 		log.Printf("[Decide] Model does not support FC, using YAML path")
 		return n.execWithYAML(ctx, prep)
 
-	default: // "yaml" or unknown
+	default: // explicit "yaml" or any unrecognised value
+		if prep.ToolCallMode != "yaml" {
+			log.Printf("[Decide] WARNING: unrecognised ToolCallMode %q, falling back to YAML", prep.ToolCallMode)
+		}
 		log.Printf("[Decide] Using YAML path")
 		return n.execWithYAML(ctx, prep)
 	}
@@ -134,8 +137,18 @@ func (n *DecideNode) execWithFC(ctx context.Context, prep DecidePrep) (Decision,
 		}, nil
 	}
 
-	// Model returned text → treat as direct answer
+	// Model returned text — check for native FC token format before treating as answer.
+	// Some models (e.g. Kimi-K2.5) embed tool calls in Content using special tokens
+	// instead of the standard tool_calls field, so we parse them here.
 	if content := strings.TrimSpace(resp.Content); len(content) > 0 {
+		if strings.Contains(content, "<|tool_calls_section_begin|>") {
+			if decision, ok := parseNativeFCContent(content, prep.ToolDefinitions); ok {
+				log.Printf("[Decide] Parsed native FC tokens → action=tool name=%s", decision.ToolName)
+				return decision, nil
+			}
+			// Native tokens present but unparseable — trigger auto-downgrade to YAML
+			return Decision{}, fmt.Errorf("FC returned unparseable native token format")
+		}
 		return Decision{Action: "answer", Answer: content}, nil
 	}
 
@@ -279,6 +292,15 @@ func (n *DecideNode) buildSystemPrompt(mode string) string {
 		if ruleGuide := n.loader.Load("rule_guide.md"); ruleGuide != "" {
 			sb.WriteString("\n\n")
 			sb.WriteString(ruleGuide)
+		}
+		// skill creation guides — teach agent how to build custom MCP tools
+		if mcpGuide := n.loader.Load("mcp_server_guide.md"); mcpGuide != "" {
+			sb.WriteString("\n\n")
+			sb.WriteString(mcpGuide)
+		}
+		if skillDocGuide := n.loader.Load("skill_doc_guide.md"); skillDocGuide != "" {
+			sb.WriteString("\n\n")
+			sb.WriteString(skillDocGuide)
 		}
 	}
 
@@ -573,4 +595,72 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return string(runes[:maxLen]) + "..."
+}
+
+// parseNativeFCContent extracts a tool call from models (e.g. Kimi-K2.5) that
+// embed FC intent in the Content field using special tokens rather than the
+// standard tool_calls field.
+//
+// Expected format in Content:
+//
+//	<|tool_calls_section_begin|>[{"name":"tool","parameters":{...}}]<|tool_call_end|>
+//
+// The function also tolerates "arguments" as an alias for "parameters" to handle
+// minor format variations across model versions.
+//
+// Returns the parsed Decision and true on success; zero-value Decision and false
+// when the format doesn't match, JSON is malformed, or the tool name is unknown.
+func parseNativeFCContent(content string, toolDefs []llm.ToolDefinition) (Decision, bool) {
+	const startMark = "<|tool_calls_section_begin|>"
+	const endMark = "<|tool_call_end|>"
+
+	startIdx := strings.Index(content, startMark)
+	endIdx := strings.Index(content, endMark)
+	if startIdx < 0 || endIdx <= startIdx {
+		return Decision{}, false
+	}
+
+	jsonStr := strings.TrimSpace(content[startIdx+len(startMark) : endIdx])
+
+	// Kimi format: array of objects with "name" and "parameters" (or "arguments")
+	var calls []struct {
+		Name       string         `json:"name"`
+		Parameters map[string]any `json:"parameters"`
+		Arguments  map[string]any `json:"arguments"` // fallback alias
+	}
+	if err := json.Unmarshal([]byte(jsonStr), &calls); err != nil || len(calls) == 0 {
+		log.Printf("[Decide] Native FC tokens: JSON parse failed (json=%s): %v", truncate(jsonStr, 120), err)
+		return Decision{}, false
+	}
+
+	tc := calls[0]
+	params := tc.Parameters
+	if params == nil {
+		params = tc.Arguments
+	}
+	if params == nil {
+		params = make(map[string]any)
+	}
+
+	// Validate tool name against registered definitions
+	if len(toolDefs) > 0 {
+		found := false
+		for _, td := range toolDefs {
+			if td.Name == tc.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			log.Printf("[Decide] Native FC tokens: unknown tool %q", tc.Name)
+			return Decision{}, false
+		}
+	}
+
+	return Decision{
+		Action:     "tool",
+		Reason:     fmt.Sprintf("native FC: call %s", tc.Name),
+		ToolName:   tc.Name,
+		ToolParams: params,
+	}, true
 }

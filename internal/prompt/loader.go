@@ -256,3 +256,28 @@ func (l *PromptLoader) Reload() {
 	l.cache = make(map[string]string)
 	l.mu.Unlock()
 }
+
+// PatchFile loads the named prompt file (via the normal priority chain), replaces
+// oldStr with newStr, and stores the result in the cache so that subsequent Load
+// calls return the patched version without re-reading the file.
+//
+// This is used at startup to inject live environment data (e.g. runtime probe
+// results) into prompt templates that contain placeholder strings like
+// "{{RUNTIME_ENV}}". If oldStr is not found in the file content the cache is
+// still populated with the unmodified content (no-op replacement).
+//
+// Thread-safe.  A call to Reload() clears the patch; re-apply after reload if needed.
+func (l *PromptLoader) PatchFile(name, oldStr, newStr string) {
+	cacheKey := "l2:" + name
+
+	// Load through the normal chain (may hit cache or read from disk/embed).
+	content := l.Load(name)
+
+	// Apply the string replacement.
+	patched := strings.ReplaceAll(content, oldStr, newStr)
+
+	// Store the patched version, overwriting any previously cached entry.
+	l.mu.Lock()
+	l.cache[cacheKey] = patched
+	l.mu.Unlock()
+}

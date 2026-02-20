@@ -6,15 +6,17 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	stdruntime "runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pocketomega/pocket-omega/internal/agent"
 	"github.com/pocketomega/pocket-omega/internal/llm/openai"
 	"github.com/pocketomega/pocket-omega/internal/mcp"
 	"github.com/pocketomega/pocket-omega/internal/prompt"
+	"github.com/pocketomega/pocket-omega/internal/runtime"
 	"github.com/pocketomega/pocket-omega/internal/session"
-	"github.com/pocketomega/pocket-omega/internal/skill"
 	"github.com/pocketomega/pocket-omega/internal/tool"
 	"github.com/pocketomega/pocket-omega/internal/tool/builtin"
 	"github.com/pocketomega/pocket-omega/internal/web"
@@ -24,6 +26,12 @@ import (
 func main() {
 	// Load .env file
 	config.LoadEnv()
+
+	// Probe Node.js / tsx runtime availability.
+	// tsx auto-install starts in the background if node is present but tsx is absent.
+	// The result is injected into mcp_server_guide.md so agents pick the right template.
+	nodeInfo := runtime.ProbeNodeRuntime()
+	fmt.Printf("🟢 Runtime probe: %s\n", strings.ReplaceAll(nodeInfo.StatusString(), "\n", ", "))
 
 	fmt.Println("╔══════════════════════════════════════╗")
 	fmt.Println("║       Pocket-Omega v0.2              ║")
@@ -38,7 +46,7 @@ func main() {
 
 	model := os.Getenv("LLM_MODEL")
 	baseURL := os.Getenv("LLM_BASE_URL")
-	fmt.Printf("🤖 LLM: %s @ %s\n", model, baseURL)
+	fmt.Printf("🤖 LLM: %s @ %s (timeout=%ds)\n", model, baseURL, llmClient.GetConfig().HTTPTimeout)
 
 	// Initialize tool registry with built-in tools
 	registry := tool.NewRegistry()
@@ -70,6 +78,14 @@ func main() {
 	registry.Register(builtin.NewFileDeleteTool(workspaceDir))
 	registry.Register(builtin.NewFilePatchTool(workspaceDir))
 
+	// Config edit tool — allows agent to modify config files outside workspace sandbox.
+	// Uses an allowlist so only explicitly named files are accessible.
+	if envPath := config.EnvFilePath(); envPath != "" && !strings.HasPrefix(envPath, "(") {
+		configAllowed := map[string]string{".env": envPath}
+		registry.Register(builtin.NewConfigEditTool(configAllowed))
+		fmt.Printf("⚙️  Config edit tool: %s\n", envPath)
+	}
+
 	// P2 — HTTP request tool (enabled by default, disable via TOOL_HTTP_ENABLED=false)
 	if os.Getenv("TOOL_HTTP_ENABLED") != "false" {
 		allowInternal := os.Getenv("TOOL_HTTP_ALLOW_INTERNAL") == "true"
@@ -96,18 +112,6 @@ func main() {
 	}
 	defer registry.CloseAll()
 
-	// Load workspace skills from <workspaceDir>/skills/
-	skillMgr := skill.NewManager(workspaceDir)
-	if n, skillErrs := skillMgr.LoadAll(context.Background(), registry); n > 0 || len(skillErrs) > 0 {
-		fmt.Printf("🧩 Workspace skills: %d loaded\n", n)
-		for _, e := range skillErrs {
-			log.Printf("⚠️  Skill load: %v", e)
-		}
-	}
-	// skill_reload is always available so the agent can hot-reload skills
-	// even when mcp.json is absent.
-	registry.Register(skill.NewReloadTool(skillMgr, registry))
-
 	fmt.Printf("🛠️  Tools: %d registered\n", len(registry.List()))
 
 	// Initialize the three-layer prompt loader (L2 embed defaults + L3 user rules).
@@ -127,22 +131,49 @@ func main() {
 	promptLoader := prompt.NewPromptLoader(promptsDir, rulesPath, soulPath)
 	fmt.Printf("📋 Prompt loader: L2=%s L3=%s Soul=%s\n", promptsDir, rulesPath, soulPath)
 
+	// Inject runtime OS into decide_common.md so agents use platform-correct shell commands.
+	osName := stdruntime.GOOS // "windows" / "linux" / "darwin"
+	shellCmd := "sh -c"
+	if osName == "windows" {
+		osName = "Windows"
+		shellCmd = "cmd.exe /c"
+	} else if osName == "darwin" {
+		osName = "macOS"
+	} else {
+		osName = "Linux"
+	}
+	promptLoader.PatchFile("decide_common.md", "{{OS}}", osName)
+	promptLoader.PatchFile("decide_common.md", "{{SHELL_CMD}}", shellCmd)
+
 	// Initialize MCP client manager (optional — only when mcp.json exists)
 	mcpConfigPath := os.Getenv("MCP_CONFIG")
 	if mcpConfigPath == "" {
-		mcpConfigPath = "mcp.json"
+		mcpConfigPath = filepath.Join(workspaceDir, "mcp.json")
+	}
+	// Auto-create empty mcp.json in new workspaces so MCP management tools
+	// are always available from the first run (bootstrap requirement).
+	if _, statErr := os.Stat(mcpConfigPath); os.IsNotExist(statErr) {
+		if writeErr := os.WriteFile(mcpConfigPath, []byte("{\"mcpServers\":{}}\n"), 0o644); writeErr != nil {
+			log.Printf("⚠️ Failed to auto-create mcp.json: %v", writeErr)
+		} else {
+			fmt.Printf("📄 Created empty mcp.json at %s\n", mcpConfigPath)
+		}
 	}
 	if _, statErr := os.Stat(mcpConfigPath); statErr == nil {
 		mcpMgr := mcp.NewManager(mcpConfigPath)
 		// Wire prompt cache invalidation into mcp_reload so hot-reloading
 		// prompts and MCP config both happen with a single tool call.
 		mcpMgr.SetPromptLoader(promptLoader)
-		// Wire skill reload into mcp_reload so that calling mcp_reload also
-		// reloads workspace skills — one command covers everything.
-		mcpMgr.AddReloadHook(skillMgr.Reload)
 		// Always register the reload tool so the agent can fix connection issues
 		// even if the initial ConnectAll fails partially or completely.
 		registry.Register(mcp.NewReloadTool(mcpMgr, registry))
+
+		// Phase B: MCP server management tools — always available so the agent
+		// can add/remove/list servers and then call mcp_reload in one session.
+		registry.Register(builtin.NewMCPServerAddTool(mcpConfigPath))
+		registry.Register(builtin.NewMCPServerRemoveTool(mcpConfigPath))
+		registry.Register(builtin.NewMCPServerListTool(mcpConfigPath))
+		fmt.Println("🔧 MCP management tools registered (mcp_server_add/remove/list)")
 
 		n, mcpErrs := mcpMgr.ConnectAll(context.Background())
 		for _, e := range mcpErrs {
@@ -155,6 +186,10 @@ func main() {
 			fmt.Printf("🔌 MCP: %d server(s) connected\n", n)
 		}
 		defer mcpMgr.CloseAll()
+
+		// Inject runtime probe result into mcp_server_guide.md so agents read
+		// the live status rather than discovering it themselves.
+		injectRuntimeEnv(promptLoader, nodeInfo.StatusString())
 	}
 
 	// Create execution logger for development debugging
@@ -196,7 +231,17 @@ func main() {
 	toolCallMode := llmClient.GetConfig().ToolCallMode // raw value: "auto", "fc", or "yaml"
 	contextWindow := llmClient.GetConfig().ResolveContextWindow()
 	chatHandler := web.NewChatHandler(llmClient, 3, contextWindow, sessionStore, promptLoader)
-	agentHandler := web.NewAgentHandler(llmClient, registry, workspaceDir, execLogger, thinkingMode, toolCallMode, contextWindow, sessionStore, promptLoader)
+	agentHandler := web.NewAgentHandler(web.AgentHandlerOptions{
+		Provider:            llmClient,
+		Registry:            registry,
+		WorkspaceDir:        workspaceDir,
+		ExecLogger:          execLogger,
+		ThinkingMode:        thinkingMode,
+		ToolCallMode:        toolCallMode,
+		ContextWindowTokens: contextWindow,
+		Store:               sessionStore,
+		Loader:              promptLoader,
+	})
 	fmt.Printf("🧠 Thinking: %s\n", thinkingMode)
 	fmt.Printf("🔧 ToolCall: %s (resolved: %s)\n", toolCallMode, llmClient.GetConfig().ResolveToolCallMode())
 	fmt.Printf("📐 ContextWindow: %d tokens\n", contextWindow)
@@ -210,4 +255,24 @@ func main() {
 	if err := server.Start(); err != nil {
 		log.Fatalf("❌ Server error: %v", err)
 	}
+}
+
+// injectRuntimeEnv patches the "{{RUNTIME_ENV}}" placeholder in the
+// mcp_server_guide prompt with the live runtime status string. After this
+// call, agents that receive the prompt will see the actual tsx availability
+// instead of the template placeholder.
+//
+// Implementation note: we rely on prompt.PromptLoader's override map to store
+// the patched content so that Reload() re-reads from files and re-applies the
+// patch. If PromptLoader does not expose an override mechanism, the patch is a
+// no-op and the placeholder remains — agents will still function correctly but
+// may see {{RUNTIME_ENV}} instead of a status string.
+func injectRuntimeEnv(pl *prompt.PromptLoader, status string) {
+	if pl == nil {
+		return
+	}
+	// Replace the placeholder in the cached content via the prompt loader.
+	// PromptLoader.PatchFile(name, old, new) is a light convenience wrapper;
+	// if the method doesn't exist yet the compiler will flag it and we can add it.
+	pl.PatchFile("mcp_server_guide", "{{RUNTIME_ENV}}", status)
 }

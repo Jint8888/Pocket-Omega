@@ -502,6 +502,31 @@
             box-shadow: none;
         }
 
+        #stop-btn {
+            background: linear-gradient(135deg, #dc2626, #ef4444);
+            color: #fff;
+            border: none;
+            border-radius: 12px;
+            width: 44px;
+            height: 44px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 2px 8px rgba(220, 38, 38, 0.3);
+        }
+
+        #stop-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 16px rgba(220, 38, 38, 0.45);
+        }
+
+        #stop-btn:active {
+            transform: translateY(0);
+        }
+
         .footer-info {
             display: flex;
             align-items: center;
@@ -610,6 +635,11 @@
                     <polygon points="22 2 15 22 11 13 2 9 22 2" />
                 </svg>
             </button>
+            <button id="stop-btn" onclick="stopMessage()" title="停止">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="3" y="3" width="18" height="18" rx="2" />
+                </svg>
+            </button>
         </div>
         <div class="footer-info">
             <span class="footer-text">Pocket-Omega v0.2</span>
@@ -633,6 +663,23 @@
         const chatBox = document.getElementById('chat-container');
         const input = document.getElementById('msg-input');
         const btn = document.getElementById('send-btn');
+        const stopBtn = document.getElementById('stop-btn');
+
+        let currentController = null; // AbortController for the active request
+
+        function setRunning(running) {
+            btn.disabled = running;
+            btn.style.display = running ? 'none' : 'flex';
+            stopBtn.style.display = running ? 'flex' : 'none';
+            input.disabled = running;
+        }
+
+        function stopMessage() {
+            if (currentController) {
+                currentController.abort();
+                currentController = null;
+            }
+        }
 
         input.addEventListener('keydown', function (e) {
             if (e.key === 'Enter' && !e.shiftKey) {
@@ -874,7 +921,8 @@
             if (!text) return;
 
             input.value = '';
-            btn.disabled = true;
+            currentController = new AbortController();
+            setRunning(true);
             addUserMsg(text);
             addLoading();
 
@@ -885,7 +933,11 @@
 
                 const endpoint = isAgentMode() ? '/api/agent' : '/api/chat';
 
-                const resp = await fetch(endpoint, { method: 'POST', body: formData });
+                const resp = await fetch(endpoint, {
+                    method: 'POST',
+                    body: formData,
+                    signal: currentController.signal
+                });
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
 
                 const reader = resp.body.getReader();
@@ -925,9 +977,16 @@
 
             } catch (err) {
                 removeLoading();
-                addAiMsg('请求失败: ' + err.message, true);
+                finalizeThinkingBox();
+                finalizeAgentBox();
+                if (err.name === 'AbortError') {
+                    addAiMsg('⏹ 已停止', false);
+                } else {
+                    addAiMsg('请求失败: ' + err.message, true);
+                }
             } finally {
-                btn.disabled = false;
+                currentController = null;
+                setRunning(false);
                 input.focus();
             }
         }

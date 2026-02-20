@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -141,11 +140,7 @@ func (t *ShellTool) Execute(ctx context.Context, args json.RawMessage) (tool.Too
 	defer cancel()
 
 	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd", "/c", a.Command)
-	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-c", a.Command)
-	}
+	cmd = newShellCmd(ctx, a.Command)
 
 	if t.workspaceDir != "" {
 		cmd.Dir = t.workspaceDir

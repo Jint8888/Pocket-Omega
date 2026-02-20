@@ -40,8 +40,11 @@ func NewClient(config *Config) (*Client, error) {
 	if config.BaseURL != "" {
 		clientConfig.BaseURL = config.BaseURL
 	}
-	// Prevent indefinite hangs when the API is unresponsive
-	clientConfig.HTTPClient = &http.Client{Timeout: 180 * time.Second}
+	// Prevent indefinite hangs when the API is unresponsive.
+	// Timeout is configurable via LLM_HTTP_TIMEOUT (seconds); default 300s to
+	// accommodate slow reasoning models (e.g. Kimi-K2.5, DeepSeek-R1).
+	httpTimeout := time.Duration(config.HTTPTimeout) * time.Second
+	clientConfig.HTTPClient = &http.Client{Timeout: httpTimeout}
 
 	return &Client{
 		client: openailib.NewClientWithConfig(clientConfig),

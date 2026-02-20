@@ -80,7 +80,6 @@ func TestCleanup_TTLEviction(t *testing.T) {
 	ttl := 50 * time.Millisecond
 	s := NewStore(ttl, 10)
 	id := "evict-me"
-	s.GetOrCreate(id)
 	s.AppendTurn(id, Turn{UserMsg: "old", Assistant: "old"})
 
 	// Wait for TTL + cleanup interval to pass

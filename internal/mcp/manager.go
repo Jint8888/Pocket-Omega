@@ -2,10 +2,13 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pocketomega/pocket-omega/internal/prompt"
 	"github.com/pocketomega/pocket-omega/internal/tool"
@@ -24,23 +27,25 @@ type ReloadHook func(ctx context.Context, registry *tool.Registry) string
 // performed outside the lock so that a slow or hung server cannot block other
 // Manager operations (e.g. CloseAll during shutdown).
 type Manager struct {
-	configPath   string
-	mu           sync.Mutex
-	configs      map[string]ServerConfig  // last successfully loaded config
-	clients      map[string]*Client       // active connections keyed by server name
-	serverTools  map[string][]string      // server name → registered tool names
-	promptLoader *prompt.PromptLoader     // optional; when set, Reload also clears prompt cache
-	reloadHooks  []ReloadHook             // optional hooks fired at end of every Reload
+	configPath       string
+	mu               sync.Mutex
+	configs          map[string]ServerConfig // last successfully loaded config
+	clients          map[string]*Client      // active connections keyed by server name
+	serverTools      map[string][]string     // server name → registered tool names
+	perCallToolInfos map[string][]ToolInfo   // tool discovery cache for per_call servers (ConnectAll → RegisterTools)
+	promptLoader     *prompt.PromptLoader    // optional; when set, Reload also clears prompt cache
+	reloadHooks      []ReloadHook            // optional hooks fired at end of every Reload
 }
 
 // NewManager creates a Manager for the given mcp.json path.
 // No connections are established until ConnectAll is called.
 func NewManager(configPath string) *Manager {
 	return &Manager{
-		configPath:  configPath,
-		configs:     make(map[string]ServerConfig),
-		clients:     make(map[string]*Client),
-		serverTools: make(map[string][]string),
+		configPath:       configPath,
+		configs:          make(map[string]ServerConfig),
+		clients:          make(map[string]*Client),
+		serverTools:      make(map[string][]string),
+		perCallToolInfos: make(map[string][]ToolInfo),
 	}
 }
 
@@ -74,22 +79,45 @@ func (m *Manager) ConnectAll(ctx context.Context) (int, []error) {
 		return 0, []error{fmt.Errorf("mcp: load config: %w", err)}
 	}
 
-	// Establish all connections outside the lock.
+	// Establish connections outside the lock.
+	// per_call servers: connect temporarily to discover tools, then close immediately.
+	// The client stored in m.clients for per_call is nil; Execute() creates fresh
+	// connections on demand using cfg stored in the adapter.
 	type connResult struct {
-		name string
-		cfg  ServerConfig
-		cli  *Client
-		err  error
+		name  string
+		cfg   ServerConfig
+		cli   *Client // nil for per_call after tool discovery
+		tools []ToolInfo
+		err   error
 	}
 	results := make([]connResult, 0, len(configs))
 	for name, cfg := range configs {
-		cli := NewClient(cfg)
-		if err := cli.Connect(ctx); err != nil {
-			results = append(results, connResult{name: name, err: err})
-			log.Printf("[MCP] Connect failed: %s: %v", name, err)
+		if cfg.Lifecycle == "per_call" {
+			// Temporary connection: discover tools then close.
+			tmp := NewClient(cfg)
+			if err := tmp.Connect(ctx); err != nil {
+				results = append(results, connResult{name: name, err: err})
+				log.Printf("[MCP] per_call probe failed: %s: %v", name, err)
+				continue
+			}
+			tools, err := tmp.ListTools(ctx)
+			_ = tmp.Close() // ephemeral — close immediately after discovery
+			if err != nil {
+				results = append(results, connResult{name: name, err: err})
+				log.Printf("[MCP] per_call list tools failed: %s: %v", name, err)
+				continue
+			}
+			results = append(results, connResult{name: name, cfg: cfg, cli: nil, tools: tools})
+			log.Printf("[MCP] per_call discovered: %s (%d tool(s))", name, len(tools))
 		} else {
-			results = append(results, connResult{name: name, cfg: cfg, cli: cli})
-			log.Printf("[MCP] Connected: %s (%s)", name, cfg.Transport)
+			cli := NewClient(cfg)
+			if err := cli.Connect(ctx); err != nil {
+				results = append(results, connResult{name: name, err: err})
+				log.Printf("[MCP] Connect failed: %s: %v", name, err)
+			} else {
+				results = append(results, connResult{name: name, cfg: cfg, cli: cli})
+				log.Printf("[MCP] Connected: %s (%s)", name, cfg.Transport)
+			}
 		}
 	}
 
@@ -104,35 +132,59 @@ func (m *Manager) ConnectAll(ctx context.Context) (int, []error) {
 			errs = append(errs, fmt.Errorf("server %q: %w", r.name, r.err))
 			continue
 		}
-		m.clients[r.name] = r.cli
+		m.clients[r.name] = r.cli // nil for per_call
 		m.configs[r.name] = r.cfg
+		// Cache per_call tool infos so RegisterTools can register adapters
+		// without a redundant network round-trip. Persistent servers discover
+		// their tools during the RegisterTools call itself.
+		if r.cli == nil && len(r.tools) > 0 {
+			m.perCallToolInfos[r.name] = r.tools
+		}
 		connected++
 	}
 	return connected, errs
 }
 
-// RegisterTools lists the tools from all connected servers and registers
+// RegisterTools lists the tools from all configured servers and registers
 // them as MCPToolAdapter instances in the provided registry.
-// Network I/O (ListTools calls) is performed outside the lock.
+//
+// For persistent servers: ListTools is called on the live client (network I/O
+// performed outside the lock).
+// For per_call servers: tools were already discovered during ConnectAll;
+// RegisterTools reads the cached list from serverTools and creates adapters
+// directly without any network I/O.
 func (m *Manager) RegisterTools(ctx context.Context, registry *tool.Registry) error {
-	// Snapshot connected clients under the lock.
+	// Snapshot connected clients and configs under the lock.
 	m.mu.Lock()
 	snap := make(map[string]*Client, len(m.clients))
+	cfgSnap := make(map[string]ServerConfig, len(m.configs))
 	for name, cli := range m.clients {
 		snap[name] = cli
+		cfgSnap[name] = m.configs[name]
 	}
 	m.mu.Unlock()
 
-	// Fetch tool lists outside the lock (network I/O).
+	// Fetch tool lists outside the lock (network I/O for persistent servers only).
 	type fetchResult struct {
 		name  string
+		cfg   ServerConfig
 		tools []ToolInfo
 		err   error
 	}
 	results := make([]fetchResult, 0, len(snap))
 	for name, cli := range snap {
+		cfg := cfgSnap[name]
+		if cli == nil {
+			// per_call: consume the tool list cached by ConnectAll — no network I/O.
+			m.mu.Lock()
+			cached := m.perCallToolInfos[name]
+			delete(m.perCallToolInfos, name) // consume once; re-populated on next Reload
+			m.mu.Unlock()
+			results = append(results, fetchResult{name: name, cfg: cfg, tools: cached})
+			continue
+		}
 		tools, err := cli.ListTools(ctx)
-		results = append(results, fetchResult{name: name, tools: tools, err: err})
+		results = append(results, fetchResult{name: name, cfg: cfg, tools: tools, err: err})
 	}
 
 	// Register adapters and update serverTools under the lock.
@@ -145,7 +197,7 @@ func (m *Manager) RegisterTools(ctx context.Context, registry *tool.Registry) er
 		}
 		var toolNames []string
 		for _, ti := range r.tools {
-			adapter := NewMCPToolAdapter(r.name, ti, m.clients[r.name])
+			adapter := NewMCPToolAdapter(r.name, ti, m.clients[r.name], r.cfg)
 			registry.Register(adapter)
 			toolNames = append(toolNames, adapter.Name())
 		}
@@ -228,11 +280,12 @@ func (m *Manager) Reload(ctx context.Context, registry *tool.Registry) (string, 
 	for _, cfg := range toAdd {
 		res := addResult{name: cfg.Name, cfg: cfg}
 
-		// Security scan for stdio Python scripts.
+		// Security scan for stdio scripts. Persists scan_result + scanned_at to mcp.json _meta.
 		if cfg.Transport == "stdio" {
 			pyScript := findPyScript(cfg)
 			if pyScript != "" {
 				findings, scanErr := ScanScript(pyScript)
+				today := time.Now().Format("2006-01-02")
 				if scanErr != nil {
 					res.notice = fmt.Sprintf("[WARNING] scan error for %q: %v", cfg.Name, scanErr)
 					// Non-blocking: attempt to connect anyway (read error != malicious).
@@ -247,32 +300,64 @@ func (m *Manager) Reload(ctx context.Context, registry *tool.Registry) (string, 
 					}
 					res.blocked = true
 					res.notice = strings.Join(lines, "\n")
+					updateServerMeta(m.configPath, cfg.Name, map[string]string{
+						"scan_result": "blocked",
+						"scanned_at":  today,
+					})
 					addResults = append(addResults, res)
 					continue
 				} else {
-					LogFindings(cfg.Name, findings) // logs warnings
+					LogFindings(cfg.Name, findings) // logs warnings (if any)
+					scanResult := "clean"
+					if len(findings) > 0 {
+						scanResult = "warning"
+					}
+					updateServerMeta(m.configPath, cfg.Name, map[string]string{
+						"scan_result": scanResult,
+						"scanned_at":  today,
+					})
 				}
 			}
 		}
 
-		// Connect and list tools.
-		cli := NewClient(cfg)
-		if err := cli.Connect(ctx); err != nil {
-			res.err = err
-			res.notice = fmt.Sprintf("[WARNING] connect %q: %v", cfg.Name, err)
-			addResults = append(addResults, res)
-			continue
+		// Connect and list tools (per_call: ephemeral connection; persistent: kept alive).
+		if cfg.Lifecycle == "per_call" {
+			tmp := NewClient(cfg)
+			if err := tmp.Connect(ctx); err != nil {
+				res.err = err
+				res.notice = fmt.Sprintf("[WARNING] connect %q: %v", cfg.Name, err)
+				addResults = append(addResults, res)
+				continue
+			}
+			tools, err := tmp.ListTools(ctx)
+			_ = tmp.Close() // ephemeral — close immediately after discovery
+			if err != nil {
+				res.err = err
+				res.notice = fmt.Sprintf("[WARNING] list tools %q: %v", cfg.Name, err)
+				addResults = append(addResults, res)
+				continue
+			}
+			// res.cli stays nil; adapters reconnect per Execute() call.
+			res.tools = tools
+		} else {
+			cli := NewClient(cfg)
+			if err := cli.Connect(ctx); err != nil {
+				res.err = err
+				res.notice = fmt.Sprintf("[WARNING] connect %q: %v", cfg.Name, err)
+				addResults = append(addResults, res)
+				continue
+			}
+			tools, err := cli.ListTools(ctx)
+			if err != nil {
+				_ = cli.Close()
+				res.err = err
+				res.notice = fmt.Sprintf("[WARNING] list tools %q: %v", cfg.Name, err)
+				addResults = append(addResults, res)
+				continue
+			}
+			res.cli = cli
+			res.tools = tools
 		}
-		tools, err := cli.ListTools(ctx)
-		if err != nil {
-			_ = cli.Close()
-			res.err = err
-			res.notice = fmt.Sprintf("[WARNING] list tools %q: %v", cfg.Name, err)
-			addResults = append(addResults, res)
-			continue
-		}
-		res.cli = cli
-		res.tools = tools
 		addResults = append(addResults, res)
 	}
 
@@ -284,17 +369,19 @@ func (m *Manager) Reload(ctx context.Context, registry *tool.Registry) (string, 
 		if res.notice != "" {
 			notices = append(notices, res.notice)
 		}
-		if res.blocked || res.err != nil || res.cli == nil {
+		if res.blocked || res.err != nil {
 			continue
 		}
+		// Both persistent (res.cli != nil) and per_call (res.cli == nil) are handled
+		// here: per_call adapters carry cfg and reconnect on each Execute().
 		var toolNames []string
 		for _, ti := range res.tools {
-			adapter := NewMCPToolAdapter(res.name, ti, res.cli)
+			adapter := NewMCPToolAdapter(res.name, ti, res.cli, res.cfg)
 			registry.Register(adapter)
 			toolNames = append(toolNames, adapter.Name())
 		}
 		m.mu.Lock()
-		m.clients[res.name] = res.cli
+		m.clients[res.name] = res.cli // nil for per_call
 		m.configs[res.name] = res.cfg
 		m.serverTools[res.name] = toolNames
 		m.mu.Unlock()
@@ -319,7 +406,7 @@ func (m *Manager) Reload(ctx context.Context, registry *tool.Registry) (string, 
 		summary += "\nPrompt cache cleared."
 	}
 
-	// Fire any registered reload hooks (e.g. workspace skill manager).
+	// Fire any registered reload hooks (extension point for external integrations).
 	m.mu.Lock()
 	hooks := make([]ReloadHook, len(m.reloadHooks))
 	copy(hooks, m.reloadHooks)
@@ -346,11 +433,56 @@ func (m *Manager) CloseAll() {
 	m.mu.Unlock()
 
 	for name, cli := range clients {
+		if cli == nil {
+			continue // per_call servers have no persistent connection to close
+		}
 		if err := cli.Close(); err != nil {
 			log.Printf("[MCP] Close error for %q: %v", name, err)
 		}
 	}
 	log.Printf("[MCP] All connections closed")
+}
+
+// updateServerMeta merges key-value pairs into the _meta object of a named
+// server entry in mcp.json, preserving all other existing fields and keys.
+// This is a best-effort operation — failures are logged but do not interrupt Reload.
+func updateServerMeta(configPath, serverName string, updates map[string]string) {
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		log.Printf("[MCP] updateServerMeta: read %q: %v", configPath, err)
+		return
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		log.Printf("[MCP] updateServerMeta: parse: %v", err)
+		return
+	}
+	servers, ok := root["mcpServers"].(map[string]any)
+	if !ok {
+		return
+	}
+	entry, ok := servers[serverName].(map[string]any)
+	if !ok {
+		return
+	}
+	meta, _ := entry["_meta"].(map[string]any)
+	if meta == nil {
+		meta = make(map[string]any)
+	}
+	for k, v := range updates {
+		meta[k] = v
+	}
+	entry["_meta"] = meta
+	servers[serverName] = entry
+	root["mcpServers"] = servers
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		log.Printf("[MCP] updateServerMeta: marshal: %v", err)
+		return
+	}
+	if err := os.WriteFile(configPath, out, 0o644); err != nil {
+		log.Printf("[MCP] updateServerMeta: write: %v", err)
+	}
 }
 
 // findPyScript returns the first .py file referenced in a ServerConfig,

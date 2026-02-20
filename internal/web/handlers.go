@@ -254,6 +254,10 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	if solution == "" {
 		solution = "抱歉，未能生成回答。请重试。"
 	} else {
+		// ChatHandler uses ThinkingFlow which has no AnswerNode — the raw CoT
+		// conclusion needs a formatting pass to produce a polished user-facing answer.
+		// (AgentHandler skips this step because its AnswerNode already synthesizes
+		// the final response with an LLM call, making a second pass redundant.)
 		formatted, err := formatSolution(ctx, h.llmProvider, h.loader, userMsg, solution)
 		if err != nil {
 			log.Printf("[Format] Formatting failed, using raw solution: %v", err)
@@ -277,6 +281,21 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 
 // ── Agent Handler (Phase 2) ──
 
+// AgentHandlerOptions groups all configuration for AgentHandler.
+// Use this instead of positional parameters to keep NewAgentHandler maintainable
+// as new options are added over time.
+type AgentHandlerOptions struct {
+	Provider            llm.LLMProvider
+	Registry            *tool.Registry
+	WorkspaceDir        string
+	ExecLogger          *agent.ExecLogger
+	ThinkingMode        string
+	ToolCallMode        string
+	ContextWindowTokens int
+	Store               *session.Store
+	Loader              *prompt.PromptLoader // optional — falls back to hardcoded defaults
+}
+
 // AgentHandler handles agent requests with tool usage capability.
 type AgentHandler struct {
 	llmProvider         llm.LLMProvider
@@ -291,20 +310,19 @@ type AgentHandler struct {
 	loader              *prompt.PromptLoader
 }
 
-// NewAgentHandler creates a new agent handler.
-// loader is optional (nil is valid) — nodes fall back to hardcoded defaults.
-func NewAgentHandler(provider llm.LLMProvider, registry *tool.Registry, workspaceDir string, execLogger *agent.ExecLogger, thinkingMode string, toolCallMode string, contextWindowTokens int, store *session.Store, loader *prompt.PromptLoader) *AgentHandler {
+// NewAgentHandler creates a new agent handler from AgentHandlerOptions.
+func NewAgentHandler(opts AgentHandlerOptions) *AgentHandler {
 	return &AgentHandler{
-		llmProvider:         provider,
-		agentFlow:           agent.BuildAgentFlow(provider, registry, thinkingMode, loader),
-		toolRegistry:        registry,
-		workspaceDir:        workspaceDir,
-		execLogger:          execLogger,
-		thinkingMode:        thinkingMode,
-		toolCallMode:        toolCallMode,
-		contextWindowTokens: contextWindowTokens,
-		sessionStore:        store,
-		loader:              loader,
+		llmProvider:         opts.Provider,
+		agentFlow:           agent.BuildAgentFlow(opts.Provider, opts.Registry, opts.ThinkingMode, opts.Loader),
+		toolRegistry:        opts.Registry,
+		workspaceDir:        opts.WorkspaceDir,
+		execLogger:          opts.ExecLogger,
+		thinkingMode:        opts.ThinkingMode,
+		toolCallMode:        opts.ToolCallMode,
+		contextWindowTokens: opts.ContextWindowTokens,
+		sessionStore:        opts.Store,
+		loader:              opts.Loader,
 	}
 }
 

@@ -20,15 +20,27 @@ import (
 type MCPToolAdapter struct {
 	serverName string
 	info       ToolInfo
-	client     *Client
+	// client is the shared persistent connection. For per_call lifecycle it is
+	// nil — Execute() creates a fresh Client per invocation using cfg.
+	client    *Client
+	cfg       ServerConfig // used by per_call Execute to rebuild the connection
+	lifecycle string       // "persistent" (default) | "per_call"
 }
 
 // NewMCPToolAdapter creates an adapter for a single MCP tool.
-func NewMCPToolAdapter(serverName string, info ToolInfo, client *Client) *MCPToolAdapter {
+// cfg is stored so that Execute can rebuild a transient connection for
+// per_call lifecycle servers. For persistent servers client must be non-nil.
+func NewMCPToolAdapter(serverName string, info ToolInfo, client *Client, cfg ServerConfig) *MCPToolAdapter {
+	lc := cfg.Lifecycle
+	if lc == "" {
+		lc = "persistent"
+	}
 	return &MCPToolAdapter{
 		serverName: serverName,
 		info:       info,
 		client:     client,
+		cfg:        cfg,
+		lifecycle:  lc,
 	}
 }
 
@@ -52,11 +64,15 @@ func (a *MCPToolAdapter) InputSchema() json.RawMessage {
 }
 
 // Execute deserialises the JSON args and delegates to the MCP server.
+//
+// For persistent lifecycle: reuses the shared client connection.
+// For per_call lifecycle: creates a fresh Client, runs the tool, then
+// closes the process. This guarantees no residual processes are left running.
+//
 // Infrastructure errors and MCP tool-level errors are both returned as
 // a ToolResult.Error (nil Go error) so the agent can react gracefully.
 func (a *MCPToolAdapter) Execute(ctx context.Context, args json.RawMessage) (tool.ToolResult, error) {
 	var params map[string]any
-
 	if len(args) > 0 && string(args) != "null" {
 		if err := json.Unmarshal(args, &params); err != nil {
 			return tool.ToolResult{
@@ -65,7 +81,33 @@ func (a *MCPToolAdapter) Execute(ctx context.Context, args json.RawMessage) (too
 		}
 	}
 
+	if a.lifecycle == "per_call" {
+		return a.executePerCall(ctx, params)
+	}
+	return a.executePersistent(ctx, params)
+}
+
+// executePersistent delegates to the long-lived shared client.
+func (a *MCPToolAdapter) executePersistent(ctx context.Context, params map[string]any) (tool.ToolResult, error) {
 	text, err := a.client.CallTool(ctx, a.info.Name, params)
+	if err != nil {
+		return tool.ToolResult{Error: err.Error()}, nil
+	}
+	return tool.ToolResult{Output: text}, nil
+}
+
+// executePerCall creates an ephemeral Client, connects, calls the tool, then
+// closes the connection. The child process is terminated by Close().
+func (a *MCPToolAdapter) executePerCall(ctx context.Context, params map[string]any) (tool.ToolResult, error) {
+	c := NewClient(a.cfg)
+	if err := c.Connect(ctx); err != nil {
+		return tool.ToolResult{
+			Error: fmt.Sprintf("mcp per_call: connect to %q: %v", a.cfg.Name, err),
+		}, nil
+	}
+	defer c.Close() //nolint:errcheck // best-effort cleanup
+
+	text, err := c.CallTool(ctx, a.info.Name, params)
 	if err != nil {
 		return tool.ToolResult{Error: err.Error()}, nil
 	}
@@ -80,6 +122,7 @@ func (a *MCPToolAdapter) Init(_ context.Context) error {
 
 // Close satisfies the tool.Tool interface. Connection lifecycle is managed
 // by the Manager; adapters do not close the shared client.
+// For per_call adapters, there is no persistent connection to close.
 func (a *MCPToolAdapter) Close() error {
 	return nil
 }
