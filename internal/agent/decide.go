@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/pocketomega/pocket-omega/internal/core"
 	"github.com/pocketomega/pocket-omega/internal/llm"
 	"github.com/pocketomega/pocket-omega/internal/prompt"
 	"github.com/pocketomega/pocket-omega/internal/thinking"
+	"github.com/pocketomega/pocket-omega/internal/tool"
 	"gopkg.in/yaml.v3"
 )
 
@@ -43,6 +45,13 @@ func (n *DecideNode) Prep(state *AgentState) []DecidePrep {
 		toolDefs = state.ToolRegistry.GenerateToolDefinitions()
 	}
 
+	// Phase 1: compute tool summary and runtime line at Prep time
+	toolingSummary := buildToolingSection(state.ToolRegistry)
+	runtimeLine := buildRuntimeLine(state)
+
+	// Phase 2: detect MCP intent for conditional guide loading
+	hasMCPIntent := containsMCPKeywords(state.Problem)
+
 	return []DecidePrep{{
 		Problem:             state.Problem,
 		WorkspaceDir:        state.WorkspaceDir,
@@ -53,6 +62,10 @@ func (n *DecideNode) Prep(state *AgentState) []DecidePrep {
 		ThinkingMode:        state.ThinkingMode,
 		ToolCallMode:        state.ToolCallMode,
 		ConversationHistory: state.ConversationHistory,
+		ToolingSummary:      toolingSummary,
+		RuntimeLine:         runtimeLine,
+		HasMCPIntent:        hasMCPIntent,
+		ContextWindowTokens: state.ContextWindowTokens,
 	}}
 }
 
@@ -96,7 +109,7 @@ func (n *DecideNode) execWithFC(ctx context.Context, prep DecidePrep) (Decision,
 	prompt := buildDecidePromptFC(prep)
 
 	resp, err := n.llmProvider.CallLLMWithTools(ctx, []llm.Message{
-		{Role: llm.RoleSystem, Content: n.buildSystemPrompt("fc")},
+		{Role: llm.RoleSystem, Content: n.buildSystemPrompt("fc", prep)},
 		{Role: llm.RoleUser, Content: prompt},
 	}, prep.ToolDefinitions)
 	if err != nil {
@@ -161,7 +174,7 @@ func (n *DecideNode) execWithYAML(ctx context.Context, prep DecidePrep) (Decisio
 	userPrompt := buildDecidePrompt(prep)
 
 	resp, err := n.llmProvider.CallLLM(ctx, []llm.Message{
-		{Role: llm.RoleSystem, Content: n.buildSystemPrompt(prep.ThinkingMode)},
+		{Role: llm.RoleSystem, Content: n.buildSystemPrompt(prep.ThinkingMode, prep)},
 		{Role: llm.RoleUser, Content: userPrompt},
 	})
 	if err != nil {
@@ -265,10 +278,10 @@ func (n *DecideNode) ExecFallback(err error) Decision {
 //   - L3: user custom rules from rules.md (language, domain, style preferences)
 //
 // mode is one of "fc", "native", or anything else (app mode).
-func (n *DecideNode) buildSystemPrompt(mode string) string {
+func (n *DecideNode) buildSystemPrompt(mode string, prep DecidePrep) string {
 	var sb strings.Builder
 
-	// L2 persona: agent identity (loaded first to establish character)
+	// #1 Soul: agent identity (loaded first to establish character)
 	if n.loader != nil {
 		if persona := n.loader.LoadSoul(); persona != "" {
 			sb.WriteString(persona)
@@ -276,10 +289,39 @@ func (n *DecideNode) buildSystemPrompt(mode string) string {
 		}
 	}
 
-	// L1: hardcoded tool-call protocol (cannot be overridden)
+	// #2 User Rules: placed early for high LLM attention (above L1 protocol)
+	if n.loader != nil {
+		if rules := n.loader.LoadUserRules(); rules != "" {
+			sb.WriteString("## 用户自定义规则\n")
+			sb.WriteString(rules)
+			sb.WriteString("\n\n")
+		}
+	}
+
+	// #3 L1: hardcoded tool-call protocol (cannot be overridden)
 	sb.WriteString(decideL1Constraint(mode))
 
-	// L2: project behaviour rules (loaded from embed / disk file)
+	// #4 Runtime Info: compact single line (Phase 1)
+	if prep.RuntimeLine != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(prep.RuntimeLine)
+	}
+
+	// #5 Tooling Section: auto-generated tool summary (Phase 1)
+	if prep.ToolingSummary != "" {
+		sb.WriteString("\n\n")
+		sb.WriteString(prep.ToolingSummary)
+	}
+
+	// #6 Knowledge Dictionary + L2 behaviour rules
+	if n.loader != nil {
+		if knowledge := n.loader.Load("knowledge.md"); knowledge != "" {
+			sb.WriteString("\n\n")
+			sb.WriteString(knowledge)
+		}
+	}
+
+	// #7 Behavior Components
 	if n.loader != nil {
 		if common := n.loader.Load("decide_common.md"); common != "" {
 			sb.WriteString("\n\n")
@@ -293,26 +335,43 @@ func (n *DecideNode) buildSystemPrompt(mode string) string {
 			sb.WriteString("\n\n")
 			sb.WriteString(ruleGuide)
 		}
-		// skill creation guides — teach agent how to build custom MCP tools
-		if mcpGuide := n.loader.Load("mcp_server_guide.md"); mcpGuide != "" {
+		// think_guide.md — guides DecideNode on when to choose "think" action
+		if thinkGuide := n.loader.Load("think_guide.md"); thinkGuide != "" {
 			sb.WriteString("\n\n")
-			sb.WriteString(mcpGuide)
+			sb.WriteString(thinkGuide)
 		}
-		if skillDocGuide := n.loader.Load("skill_doc_guide.md"); skillDocGuide != "" {
-			sb.WriteString("\n\n")
-			sb.WriteString(skillDocGuide)
+		// Phase 2: MCP/skill creation guides — conditionally loaded based on Intent detection.
+		// Only loaded when user's Problem mentions MCP/skill/custom-tool keywords.
+		if prep.HasMCPIntent {
+			if mcpGuide := n.loader.Load("mcp_server_guide.md"); mcpGuide != "" {
+				sb.WriteString("\n\n")
+				sb.WriteString(mcpGuide)
+			}
+			if skillDocGuide := n.loader.Load("skill_doc_guide.md"); skillDocGuide != "" {
+				sb.WriteString("\n\n")
+				sb.WriteString(skillDocGuide)
+			}
 		}
 	}
 
-	// L3: user custom rules (runtime file, optional)
-	if n.loader != nil {
-		if rules := n.loader.LoadUserRules(); rules != "" {
-			sb.WriteString("\n\n## 用户自定义规则\n")
-			sb.WriteString(rules)
+	result := sb.String()
+
+	// Phase 2: Token Budget Guard — temporary character truncation.
+	// If context window is known, cap system prompt at 25% of total token budget.
+	// This is a safety net; Phase 3 will replace with component-level removal.
+	//
+	// Rune-safe: use []rune slicing to avoid cutting in the middle of a
+	// multi-byte UTF-8 character (e.g. Chinese text is 3 bytes/char).
+	if prep.ContextWindowTokens > 0 {
+		maxChars := prep.ContextWindowTokens * charsPerToken * 25 / 100
+		runes := []rune(result)
+		if len(runes) > maxChars {
+			log.Printf("[Decide] Token budget guard: system prompt %d chars exceeds %d limit, truncating", len(runes), maxChars)
+			result = string(runes[:maxChars])
 		}
 	}
 
-	return sb.String()
+	return result
 }
 
 // decideL1Constraint returns the hardcoded L1 system prompt fragment for DecideNode.
@@ -350,52 +409,6 @@ const decideL1FC = `你是一个智能助手，根据用户问题和当前上下
 你有两种选择：
 1. 调用工具 — 通过 function calling 调用合适的工具
 2. 直接回答 — 如果已有足够信息或问题简单，直接用文本回复`
-
-// getDecideSystemPrompt is retained for backward-compatibility in unit tests
-// that do not inject a loader. New code should call buildSystemPrompt instead.
-func getDecideSystemPrompt(thinkingMode string) string {
-	if thinkingMode == "native" {
-		return decideSystemPromptNative
-	}
-	return decideSystemPromptApp
-}
-
-const decideSystemPromptNative = decideL1Native + `
-
-决策原则：
-- 如果问题需要实时信息（时间、文件内容等），使用 tool
-- 如果已有足够信息或问题简单，直接 answer
-- 每个工具最多调用 2 次。禁止用不同关键词反复搜索同一个话题
-- 搜索结果不完美也没关系，用已有信息综合回答即可
-- 尽可能高效，尽早给出答案
-
-答案格式：
-- 重点关键词用 **加粗**
-- 保持语言与用户一致，不要添加"以下是答案"之类的前缀，直接作答
-
-搜索 + 阅读策略：
-- 搜索获取概览后，用 web_reader 深入阅读最相关的页面
-- web_reader 单次只读一个 URL，选择最关键的那个
-- 如果用户直接给了 URL，优先用 web_reader 而非搜索`
-
-const decideSystemPromptApp = decideL1App + `
-
-决策原则：
-- 如果问题需要实时信息（时间、文件内容等），使用 tool
-- 如果问题需要深度分析或多步推理，使用 think
-- 如果已有足够信息或问题简单，直接 answer
-- 每个工具最多调用 2 次。禁止用不同关键词反复搜索同一个话题
-- 搜索结果不完美也没关系，用已有信息综合回答即可
-- 尽可能高效，尽早给出答案
-
-答案格式：
-- 重点关键词用 **加粗**
-- 保持语言与用户一致，不要添加"以下是答案"之类的前缀，直接作答
-
-搜索 + 阅读策略：
-- 搜索获取概览后，用 web_reader 深入阅读最相关的页面
-- web_reader 单次只读一个 URL，选择最关键的那个
-- 如果用户直接给了 URL，优先用 web_reader 而非搜索`
 
 // buildDecidePromptFC builds the user prompt for FC mode (no YAML template).
 func buildDecidePromptFC(prep DecidePrep) string {
@@ -455,6 +468,7 @@ func buildDecidePrompt(prep DecidePrep) string {
 ` + "```yaml" + `
 action: "tool"  # 或 "answer"
 reason: "决策理由"
+headline: "正在执行..."  # 可选：用户可见的一句话操作摘要
 tool_name: "工具名"       # action=tool 时必需
 tool_params:              # action=tool 时必需
   param1: "value1"
@@ -466,6 +480,7 @@ answer: |                 # action=answer 时
 ` + "```yaml" + `
 action: "tool"  # 或 "think" 或 "answer"
 reason: "决策理由"
+headline: "正在执行..."  # 可选：用户可见的一句话操作摘要
 tool_name: "工具名"       # action=tool 时必需
 tool_params:              # action=tool 时必需
   param1: "value1"
@@ -663,4 +678,132 @@ func parseNativeFCContent(content string, toolDefs []llm.ToolDefinition) (Decisi
 		ToolName:   tc.Name,
 		ToolParams: params,
 	}, true
+}
+
+// ── Phase 1: Tool Summary + Runtime Line ──
+
+// coreToolOrder defines display priority for core tools (most used first).
+var coreToolOrder = []string{
+	"file_read", "file_write", "file_grep", "file_find", "file_list",
+	"file_patch", "file_move", "file_delete", "file_open",
+	"shell_exec",
+	"web_reader", "search_tavily", "search_brave", "http_request",
+	"time_get", "config_edit",
+}
+
+// mgmtToolOrder defines display priority for management tools.
+var mgmtToolOrder = []string{
+	"mcp_server_add", "mcp_server_remove", "mcp_server_list", "mcp_reload",
+}
+
+// buildToolingSection generates a compact tool summary section from Registry.
+// Tools are ordered by priority: core → management → external MCP (alphabetical).
+func buildToolingSection(registry *tool.Registry) string {
+	if registry == nil {
+		return ""
+	}
+
+	tools := registry.List()
+	if len(tools) == 0 {
+		return ""
+	}
+
+	// Build lookup map: name → tool
+	toolMap := make(map[string]tool.Tool, len(tools))
+	for _, t := range tools {
+		toolMap[t.Name()] = t
+	}
+
+	var sb strings.Builder
+	sb.WriteString("## Available Tools\n")
+
+	emitted := make(map[string]bool, len(tools))
+
+	// Emit in priority order
+	for _, name := range coreToolOrder {
+		if t, ok := toolMap[name]; ok {
+			sb.WriteString("- **")
+			sb.WriteString(name)
+			sb.WriteString("** — ")
+			sb.WriteString(firstLine(t.Description()))
+			sb.WriteByte('\n')
+			emitted[name] = true
+		}
+	}
+	for _, name := range mgmtToolOrder {
+		if t, ok := toolMap[name]; ok {
+			sb.WriteString("- **")
+			sb.WriteString(name)
+			sb.WriteString("** — ")
+			sb.WriteString(firstLine(t.Description()))
+			sb.WriteByte('\n')
+			emitted[name] = true
+		}
+	}
+
+	// Remaining tools (external MCP etc.) in alphabetical order
+	var extras []string
+	for _, t := range tools {
+		if !emitted[t.Name()] {
+			extras = append(extras, t.Name())
+		}
+	}
+	sort.Strings(extras)
+	for _, name := range extras {
+		t := toolMap[name]
+		sb.WriteString("- **")
+		sb.WriteString(name)
+		sb.WriteString("** — ")
+		sb.WriteString(firstLine(t.Description()))
+		sb.WriteByte('\n')
+	}
+
+	return sb.String()
+}
+
+// firstLine returns the first line of s (up to the first newline).
+func firstLine(s string) string {
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		return s[:idx]
+	}
+	return s
+}
+
+// buildRuntimeLine generates a compact one-line runtime environment summary.
+func buildRuntimeLine(state *AgentState) string {
+	osName := state.OSName
+	if osName == "" {
+		osName = "unknown"
+	}
+	shellCmd := state.ShellCmd
+	if shellCmd == "" {
+		shellCmd = "unknown"
+	}
+	modelName := state.ModelName
+	if modelName == "" {
+		modelName = "unknown"
+	}
+
+	return fmt.Sprintf(
+		"Runtime: os=%s | shell=%s | model=%s | ctx=%d | thinking=%s",
+		osName, shellCmd, modelName,
+		state.ContextWindowTokens,
+		state.ThinkingMode,
+	)
+}
+
+// containsMCPKeywords checks if the problem text mentions MCP or custom tool creation.
+// Used for Phase 2 intent-based conditional loading of MCP/skill guides.
+// Design: "server" alone is too broad (matches "web server", "database server"),
+// so it is omitted; "mcp" already covers all "mcp server" queries as a substring.
+// Prefers false positives over false negatives.
+func containsMCPKeywords(problem string) bool {
+	lower := strings.ToLower(problem)
+	keywords := []string{"mcp", "技能", "skill", "自定义工具", "custom tool"}
+	for _, kw := range keywords {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
 }

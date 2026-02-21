@@ -33,7 +33,6 @@ func (r *Registry) Register(t Tool) {
 		log.Printf("[Registry] WARNING: overwriting existing tool %q", t.Name())
 	}
 	r.tools[t.Name()] = t
-	log.Printf("[Registry] Registered tool: %s", t.Name())
 }
 
 // Unregister removes a tool from the registry (for hot-reload).
@@ -111,8 +110,8 @@ func (r *Registry) InitAll(ctx context.Context) error {
 		if err := t.Init(ctx); err != nil {
 			return fmt.Errorf("init tool %q: %w", name, err)
 		}
-		log.Printf("[Registry] Initialized tool: %s", name)
 	}
+	log.Printf("[Registry] Initialized %d tools", len(r.tools))
 	return nil
 }
 

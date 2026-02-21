@@ -46,7 +46,13 @@ type PromptLoader struct {
 	rulesPath  string // path to L3 rules.md
 	soulPath   string // path to user soul.md (workspace root)
 	cache      map[string]string
+	patchHooks []patchEntry // recorded PatchFile calls, reapplied after Reload
 	mu         sync.RWMutex
+}
+
+// patchEntry records a single PatchFile call for reapplication after Reload.
+type patchEntry struct {
+	Name, OldStr, NewStr string
 }
 
 // NewPromptLoader creates a PromptLoader that reads L2 files from promptsDir
@@ -255,6 +261,33 @@ func (l *PromptLoader) Reload() {
 	l.mu.Lock()
 	l.cache = make(map[string]string)
 	l.mu.Unlock()
+
+	// Reapply all recorded patches so template variables survive hot-reloads.
+	// Uses reapplyPatch (not PatchFile) to avoid re-recording duplicates.
+	for _, p := range l.patchHooks {
+		l.reapplyPatch(p)
+	}
+}
+
+// reapplyPatch re-patches a single file without recording another patchHooks
+// entry (avoids infinite growth on repeated Reloads).
+//
+// Cache-first read: an earlier reapplyPatch in the same Reload() call may have
+// already written a partially-patched version of this file into the cache.
+// We must read that version so patches accumulate correctly.  Only fall back to
+// loadUncached on a cache miss (first patch for this file in the current Reload).
+func (l *PromptLoader) reapplyPatch(p patchEntry) {
+	cacheKey := "l2:" + p.Name
+	l.mu.RLock()
+	content, ok := l.cache[cacheKey]
+	l.mu.RUnlock()
+	if !ok {
+		content = l.loadUncached(p.Name)
+	}
+	patched := strings.ReplaceAll(content, p.OldStr, p.NewStr)
+	l.mu.Lock()
+	l.cache[cacheKey] = patched
+	l.mu.Unlock()
 }
 
 // PatchFile loads the named prompt file (via the normal priority chain), replaces
@@ -280,4 +313,7 @@ func (l *PromptLoader) PatchFile(name, oldStr, newStr string) {
 	l.mu.Lock()
 	l.cache[cacheKey] = patched
 	l.mu.Unlock()
+
+	// Record for reapplication after Reload.
+	l.patchHooks = append(l.patchHooks, patchEntry{Name: name, OldStr: oldStr, NewStr: newStr})
 }

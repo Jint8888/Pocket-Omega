@@ -2,11 +2,13 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/pocketomega/pocket-omega/internal/llm"
+	"github.com/pocketomega/pocket-omega/internal/tool"
 )
 
 func TestParseDecisionValid(t *testing.T) {
@@ -433,7 +435,7 @@ func TestExecWithFC_HallucinatedToolName(t *testing.T) {
 	node := NewDecideNode(mock, nil)
 	prep := DecidePrep{
 		Problem:      "test hallucinated tool",
-		ToolCallMode: "fc",
+		ToolCallMode: "fc", // forced mode — should NOT fallback
 		ToolDefinitions: []llm.ToolDefinition{
 			{Name: "brave_search", Description: "web search"},
 			{Name: "file_read", Description: "read file"},
@@ -449,5 +451,258 @@ func TestExecWithFC_HallucinatedToolName(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "nonexistent_tool") {
 		t.Errorf("error should contain the hallucinated name, got: %v", err)
+	}
+}
+
+// ── mockTool for buildToolingSection tests ──
+
+type mockTool struct {
+	name string
+	desc string
+}
+
+func (m *mockTool) Name() string        { return m.name }
+func (m *mockTool) Description() string { return m.desc }
+func (m *mockTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{}`)
+}
+func (m *mockTool) Execute(_ context.Context, _ json.RawMessage) (tool.ToolResult, error) {
+	return tool.ToolResult{}, nil
+}
+func (m *mockTool) Init(_ context.Context) error { return nil }
+func (m *mockTool) Close() error                 { return nil }
+
+// ── buildRuntimeLine tests ──
+
+func TestBuildRuntimeLine_AllFields(t *testing.T) {
+	state := &AgentState{
+		OSName:              "Windows",
+		ShellCmd:            "cmd.exe /c",
+		ModelName:           "gemini-2.5-pro",
+		ContextWindowTokens: 131072,
+		ThinkingMode:        "app",
+	}
+	got := buildRuntimeLine(state)
+
+	checks := []struct {
+		field string
+		want  string
+	}{
+		{"os", "os=Windows"},
+		{"shell", "shell=cmd.exe /c"},
+		{"model", "model=gemini-2.5-pro"},
+		{"ctx", "ctx=131072"},
+		{"thinking", "thinking=app"},
+	}
+	for _, c := range checks {
+		if !strings.Contains(got, c.want) {
+			t.Errorf("buildRuntimeLine() missing %s: want substring %q in %q", c.field, c.want, got)
+		}
+	}
+}
+
+func TestBuildRuntimeLine_EmptyFieldsFallback(t *testing.T) {
+	state := &AgentState{} // all zero values
+	got := buildRuntimeLine(state)
+	for _, want := range []string{"os=unknown", "shell=unknown", "model=unknown"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("empty fields should produce %q, got: %q", want, got)
+		}
+	}
+}
+
+// ── buildToolingSection tests ──
+
+func TestBuildToolingSection_PriorityOrdering(t *testing.T) {
+	reg := tool.NewRegistry()
+	// Register in reverse-priority order to confirm sorting overrides insertion order.
+	reg.Register(&mockTool{"zzz_external", "External MCP tool\nsome extra line"})
+	reg.Register(&mockTool{"mcp_server_add", "MCP: add a new server"})
+	reg.Register(&mockTool{"shell_exec", "Execute shell commands"})
+	reg.Register(&mockTool{"file_read", "Read file contents"})
+
+	got := buildToolingSection(reg)
+
+	// All four tools must appear
+	for _, name := range []string{"file_read", "shell_exec", "mcp_server_add", "zzz_external"} {
+		if !strings.Contains(got, name) {
+			t.Errorf("buildToolingSection() missing tool %q\noutput:\n%s", name, got)
+		}
+	}
+
+	// Priority ordering: file_read (core) < shell_exec (core) < mcp_server_add (mgmt) < zzz_external (extra)
+	positions := map[string]int{
+		"file_read":      strings.Index(got, "file_read"),
+		"shell_exec":     strings.Index(got, "shell_exec"),
+		"mcp_server_add": strings.Index(got, "mcp_server_add"),
+		"zzz_external":   strings.Index(got, "zzz_external"),
+	}
+	ordered := [][2]string{
+		{"file_read", "shell_exec"},
+		{"shell_exec", "mcp_server_add"},
+		{"mcp_server_add", "zzz_external"},
+	}
+	for _, pair := range ordered {
+		if positions[pair[0]] > positions[pair[1]] {
+			t.Errorf("%s (pos %d) should appear before %s (pos %d)",
+				pair[0], positions[pair[0]], pair[1], positions[pair[1]])
+		}
+	}
+}
+
+func TestBuildToolingSection_FirstLineOnly(t *testing.T) {
+	// Description with multiple lines — only first line should appear in summary.
+	reg := tool.NewRegistry()
+	reg.Register(&mockTool{"file_read", "Read file contents\nDetailed second line\nThird line"})
+
+	got := buildToolingSection(reg)
+
+	if !strings.Contains(got, "Read file contents") {
+		t.Errorf("first line should appear in output, got:\n%s", got)
+	}
+	if strings.Contains(got, "Detailed second line") {
+		t.Errorf("second line should NOT appear in output, got:\n%s", got)
+	}
+}
+
+func TestBuildToolingSection_EmptyRegistry(t *testing.T) {
+	got := buildToolingSection(tool.NewRegistry())
+	if got != "" {
+		t.Errorf("empty registry: got %q, want empty string", got)
+	}
+}
+
+func TestBuildToolingSection_NilRegistry(t *testing.T) {
+	got := buildToolingSection(nil)
+	if got != "" {
+		t.Errorf("nil registry: got %q, want empty string", got)
+	}
+}
+
+// ── containsMCPKeywords tests ──
+
+func TestContainsMCPKeywords_Positive(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"bare mcp", "帮我配置 mcp 工具"},
+		{"uppercase MCP", "Can you add an MCP server?"},
+		{"技能", "我想新建一个技能"},
+		{"skill lowercase", "create a new skill for me"},
+		{"SKILL uppercase", "Add a SKILL"},
+		{"自定义工具", "我要创建一个自定义工具"},
+		{"custom tool", "I need a custom tool"},
+		{"mcp embedded in sentence", "how do I set up an mcp-based plugin"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !containsMCPKeywords(tc.input) {
+				t.Errorf("containsMCPKeywords(%q) = false, want true", tc.input)
+			}
+		})
+	}
+}
+
+func TestContainsMCPKeywords_Negative(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"empty string", ""},
+		{"web server unrelated", "deploy my web server"},
+		{"database query", "run a database query"},
+		{"plain question", "what is the weather today?"},
+		{"server without mcp", "restart the server"},
+		{"chinese unrelated", "帮我查询一下北京天气"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if containsMCPKeywords(tc.input) {
+				t.Errorf("containsMCPKeywords(%q) = true, want false", tc.input)
+			}
+		})
+	}
+}
+
+// ── Token Budget Guard tests ──
+
+func TestTokenBudgetGuard_TruncatesAtThreshold(t *testing.T) {
+	// Build a loader-less DecideNode (loader nil is safe — buildSystemPrompt guards it)
+	node := NewDecideNode(&mockLLMProvider{}, nil)
+
+	// ContextWindowTokens=100 → maxChars = 100 * 2 * 25 / 100 = 50
+	prep := DecidePrep{
+		ContextWindowTokens: 100,
+		ToolCallMode:        "yaml",
+		ThinkingMode:        "app",
+	}
+	result := node.buildSystemPrompt("app", prep)
+	maxChars := 100 * charsPerToken * 25 / 100 // 50
+	if len([]rune(result)) > maxChars {
+		t.Errorf("token budget guard: result has %d runes, want <= %d", len([]rune(result)), maxChars)
+	}
+}
+
+func TestTokenBudgetGuard_NoTruncationWhenZero(t *testing.T) {
+	// ContextWindowTokens=0 → guard disabled; result should be non-empty (L1 constant)
+	node := NewDecideNode(&mockLLMProvider{}, nil)
+	prep := DecidePrep{
+		ContextWindowTokens: 0,
+		ToolCallMode:        "yaml",
+		ThinkingMode:        "app",
+	}
+	result := node.buildSystemPrompt("app", prep)
+	if result == "" {
+		t.Error("buildSystemPrompt() returned empty string when ContextWindowTokens=0")
+	}
+}
+
+func TestTokenBudgetGuard_UTF8Safe(t *testing.T) {
+	// Verify that truncation never produces invalid UTF-8 (i.e. no mid-character cut).
+	node := NewDecideNode(&mockLLMProvider{}, nil)
+	prep := DecidePrep{
+		ContextWindowTokens: 10, // tiny budget → maxChars = 10*2*25/100 = 5
+		RuntimeLine:         "测试中文字符截断安全性验证文字",
+		ToolCallMode:        "yaml",
+		ThinkingMode:        "app",
+	}
+	result := node.buildSystemPrompt("app", prep)
+	// Confirm the result is valid UTF-8 by re-encoding to runes with no replacement chars
+	for i, r := range result {
+		if r == '\uFFFD' {
+			t.Errorf("invalid UTF-8 replacement char at position %d in truncated result", i)
+		}
+	}
+}
+
+// ── Decision.Headline YAML parsing tests ──
+
+func TestParseDecision_WithHeadline(t *testing.T) {
+	input := "```yaml\naction: tool\nreason: listing files\nheadline: 正在列出目录...\ntool_name: file_list\ntool_params:\n  path: .\n```"
+	decision, err := parseDecision(input)
+	if err != nil {
+		t.Fatalf("parseDecision() error: %v", err)
+	}
+	if decision.Action != "tool" {
+		t.Errorf("Action = %q, want %q", decision.Action, "tool")
+	}
+	if decision.Headline != "正在列出目录..." {
+		t.Errorf("Headline = %q, want %q", decision.Headline, "正在列出目录...")
+	}
+	if decision.ToolName != "file_list" {
+		t.Errorf("ToolName = %q, want %q", decision.ToolName, "file_list")
+	}
+}
+
+func TestParseDecision_HeadlineOmitEmpty(t *testing.T) {
+	// headline field absent → Decision.Headline should be empty string (zero value)
+	input := "action: answer\nreason: simple\nanswer: hello"
+	decision, err := parseDecision(input)
+	if err != nil {
+		t.Fatalf("parseDecision() error: %v", err)
+	}
+	if decision.Headline != "" {
+		t.Errorf("Headline = %q, want empty string when omitted", decision.Headline)
 	}
 }

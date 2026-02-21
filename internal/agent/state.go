@@ -22,6 +22,11 @@ type AgentState struct {
 	ContextWindowTokens int    // model context window in tokens; 0 = use safe fallback
 	ConversationHistory string // formatted conversation prefix, populated by Handler layer
 
+	// Runtime environment info — injected by AgentHandler from AgentHandlerOptions.
+	OSName    string // e.g. "Windows", "Linux", "macOS"
+	ShellCmd  string // e.g. "cmd.exe /c", "sh -c"
+	ModelName string // e.g. "gemini-2.5-pro"
+
 	// Transient field: DecideNode writes, ToolNode/ThinkNode reads.
 	// Solves node-to-node state passing.
 	LastDecision *Decision `json:"-"`
@@ -59,19 +64,24 @@ type DecidePrep struct {
 	ThinkingMode        string               // "native" or "app"
 	ToolCallMode        string               // "auto", "fc", or "yaml" — may be raw unresolved value
 	ConversationHistory string               // formatted conversation prefix from previous turns
+	ToolingSummary      string               // Phase 1: auto-generated tool summary from Registry
+	RuntimeLine         string               // Phase 1: compact runtime info line
+	HasMCPIntent        bool                 // Phase 2: whether Problem mentions MCP/skill keywords
+	ContextWindowTokens int                  // Phase 2: model context window for token budget guard
 }
 
 // Decision is the LLM's decision output.
 // In YAML mode: parsed from YAML text. In FC mode: extracted from tool_calls.
 // ToolParams uses map[string]any; converted to json.RawMessage before calling Tool.Execute().
 type Decision struct {
-	Action     string         `yaml:"action"`      // "tool", "think", "answer"
-	Reason     string         `yaml:"reason"`      // Reasoning for this decision
-	ToolName   string         `yaml:"tool_name"`   // Required when action=tool
-	ToolParams map[string]any `yaml:"tool_params"` // YAML-friendly, json.Marshal before tool call
-	Thinking   string         `yaml:"thinking"`    // Used when action=think
-	Answer     string         `yaml:"answer"`      // Used when action=answer
-	ToolCallID string         `yaml:"-"`           // FC only: tool call ID for result correlation
+	Action     string         `yaml:"action"`             // "tool", "think", "answer"
+	Reason     string         `yaml:"reason"`             // Reasoning for this decision
+	Headline   string         `yaml:"headline,omitempty"` // Optional: user-visible operation summary
+	ToolName   string         `yaml:"tool_name"`          // Required when action=tool
+	ToolParams map[string]any `yaml:"tool_params"`        // YAML-friendly, json.Marshal before tool call
+	Thinking   string         `yaml:"thinking"`           // Used when action=think
+	Answer     string         `yaml:"answer"`             // Used when action=answer
+	ToolCallID string         `yaml:"-"`                  // FC only: tool call ID for result correlation
 }
 
 // ── ToolNode generic types ──

@@ -294,6 +294,9 @@ type AgentHandlerOptions struct {
 	ContextWindowTokens int
 	Store               *session.Store
 	Loader              *prompt.PromptLoader // optional — falls back to hardcoded defaults
+	OSName              string               // e.g. "Windows" — for runtime info line
+	ShellCmd            string               // e.g. "cmd.exe /c" — for runtime info line
+	ModelName           string               // e.g. "gemini-2.5-pro" — for runtime info line
 }
 
 // AgentHandler handles agent requests with tool usage capability.
@@ -308,6 +311,9 @@ type AgentHandler struct {
 	contextWindowTokens int
 	sessionStore        *session.Store
 	loader              *prompt.PromptLoader
+	osName              string
+	shellCmd            string
+	modelName           string
 }
 
 // NewAgentHandler creates a new agent handler from AgentHandlerOptions.
@@ -323,6 +329,9 @@ func NewAgentHandler(opts AgentHandlerOptions) *AgentHandler {
 		contextWindowTokens: opts.ContextWindowTokens,
 		sessionStore:        opts.Store,
 		loader:              opts.Loader,
+		osName:              opts.OSName,
+		shellCmd:            opts.ShellCmd,
+		modelName:           opts.ModelName,
 	}
 }
 
@@ -383,6 +392,9 @@ func (h *AgentHandler) HandleAgent(w http.ResponseWriter, r *http.Request) {
 		ThinkingMode:        h.thinkingMode,
 		ToolCallMode:        h.toolCallMode,
 		ContextWindowTokens: h.contextWindowTokens,
+		OSName:              h.osName,
+		ShellCmd:            h.shellCmd,
+		ModelName:           h.modelName,
 		OnStepComplete: func(step agent.StepRecord) {
 			// Write to execution log
 			if h.execLogger != nil {

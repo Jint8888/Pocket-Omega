@@ -33,10 +33,15 @@ func main() {
 	nodeInfo := runtime.ProbeNodeRuntime()
 	fmt.Printf("🟢 Runtime probe: %s\n", strings.ReplaceAll(nodeInfo.StatusString(), "\n", ", "))
 
-	fmt.Println("╔══════════════════════════════════════╗")
-	fmt.Println("║       Pocket-Omega v0.2              ║")
-	fmt.Println("║   CoT + Tools · Go + HTMX            ║")
-	fmt.Println("╚══════════════════════════════════════╝")
+	fmt.Println(`  ██████╗  ██████╗  ██████╗██╗  ██╗███████╗████████╗`)
+	fmt.Println(`  ██╔══██╗██╔═══██╗██╔════╝██║ ██╔╝██╔════╝╚══██╔══╝`)
+	fmt.Println(`  ██████╔╝██║   ██║██║     █████╔╝ █████╗     ██║   `)
+	fmt.Println(`  ██╔═══╝ ██║   ██║██║     ██╔═██╗ ██╔══╝     ██║   `)
+	fmt.Println(`  ██║     ╚██████╔╝╚██████╗██║  ██╗███████╗   ██║   `)
+	fmt.Println(`  ╚═╝      ╚═════╝  ╚═════╝╚═╝  ╚═╝╚══════╝   ╚═╝   `)
+	fmt.Println(`         ╔═══ O M E G A    v0.2 ═════╗`)
+	fmt.Println(`         ║  CoT + Tools · Go+HTMX   ║`)
+	fmt.Println(`         ╚═══════════════════════════╝`)
 
 	// Initialize LLM client
 	llmClient, err := openai.NewClientFromEnv()
@@ -131,7 +136,8 @@ func main() {
 	promptLoader := prompt.NewPromptLoader(promptsDir, rulesPath, soulPath)
 	fmt.Printf("📋 Prompt loader: L2=%s L3=%s Soul=%s\n", promptsDir, rulesPath, soulPath)
 
-	// Inject runtime OS into decide_common.md so agents use platform-correct shell commands.
+	// Inject runtime OS/Shell into prompt templates so agents know the
+	// platform-correct shell commands and environment constraints.
 	osName := stdruntime.GOOS // "windows" / "linux" / "darwin"
 	shellCmd := "sh -c"
 	if osName == "windows" {
@@ -142,8 +148,8 @@ func main() {
 	} else {
 		osName = "Linux"
 	}
-	promptLoader.PatchFile("decide_common.md", "{{OS}}", osName)
-	promptLoader.PatchFile("decide_common.md", "{{SHELL_CMD}}", shellCmd)
+	promptLoader.PatchFile("knowledge.md", "{{OS}}", osName)
+	promptLoader.PatchFile("knowledge.md", "{{SHELL_CMD}}", shellCmd)
 
 	// Initialize MCP client manager (optional — only when mcp.json exists)
 	mcpConfigPath := os.Getenv("MCP_CONFIG")
@@ -241,6 +247,9 @@ func main() {
 		ContextWindowTokens: contextWindow,
 		Store:               sessionStore,
 		Loader:              promptLoader,
+		OSName:              osName,
+		ShellCmd:            shellCmd,
+		ModelName:           llmClient.GetConfig().Model,
 	})
 	fmt.Printf("🧠 Thinking: %s\n", thinkingMode)
 	fmt.Printf("🔧 ToolCall: %s (resolved: %s)\n", toolCallMode, llmClient.GetConfig().ResolveToolCallMode())
@@ -274,5 +283,5 @@ func injectRuntimeEnv(pl *prompt.PromptLoader, status string) {
 	// Replace the placeholder in the cached content via the prompt loader.
 	// PromptLoader.PatchFile(name, old, new) is a light convenience wrapper;
 	// if the method doesn't exist yet the compiler will flag it and we can add it.
-	pl.PatchFile("mcp_server_guide", "{{RUNTIME_ENV}}", status)
+	pl.PatchFile("mcp_server_guide.md", "{{RUNTIME_ENV}}", status)
 }

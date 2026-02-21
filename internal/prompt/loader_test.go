@@ -177,3 +177,60 @@ func TestReload_ClearsCache(t *testing.T) {
 		t.Errorf("after Reload load = %q, want %q", fresh, "after reload")
 	}
 }
+
+// ── PatchFile() + patchHooks tests ───────────────────────────────────────────
+
+func TestPatchFile_AppliesReplacement(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tmpl.md"), []byte("Hello {{NAME}}!"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	l := NewPromptLoader(dir, "", "")
+	l.PatchFile("tmpl.md", "{{NAME}}", "World")
+	got := l.Load("tmpl.md")
+	if got != "Hello World!" {
+		t.Errorf("PatchFile: got %q, want %q", got, "Hello World!")
+	}
+}
+
+func TestReload_ReappliesSinglePatch(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tmpl.md"), []byte("os={{OS}}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	l := NewPromptLoader(dir, "", "")
+	l.PatchFile("tmpl.md", "{{OS}}", "Linux")
+	l.Reload()
+	got := l.Load("tmpl.md")
+	if got != "os=Linux" {
+		t.Errorf("after Reload, single patch: got %q, want %q", got, "os=Linux")
+	}
+}
+
+func TestReload_ReappliesMultiplePatchesSameFile(t *testing.T) {
+	// Regression test: two PatchFile calls on the same file must both survive Reload.
+	// Previously, reapplyPatch loaded from disk on each call, so the second patch
+	// overwrote the first (only {{SHELL_CMD}} was replaced, {{OS}} was left raw).
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tmpl.md"), []byte("os={{OS}} shell={{SHELL_CMD}}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	l := NewPromptLoader(dir, "", "")
+	l.PatchFile("tmpl.md", "{{OS}}", "Windows")
+	l.PatchFile("tmpl.md", "{{SHELL_CMD}}", "cmd.exe /c")
+
+	want := "os=Windows shell=cmd.exe /c"
+
+	// Before Reload — both patches applied via cache chain
+	before := l.Load("tmpl.md")
+	if before != want {
+		t.Fatalf("before Reload: got %q, want %q", before, want)
+	}
+
+	// After Reload — both patches must survive via patchHooks reapplication
+	l.Reload()
+	after := l.Load("tmpl.md")
+	if after != want {
+		t.Errorf("after Reload: got %q, want %q", after, want)
+	}
+}
