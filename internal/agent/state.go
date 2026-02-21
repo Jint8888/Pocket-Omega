@@ -45,6 +45,7 @@ type StepRecord struct {
 	Input      string `json:"input"`                  // Input content
 	Output     string `json:"output"`                 // Output result
 	ToolCallID string `json:"tool_call_id,omitempty"` // FC only: correlates with model's tool call
+	IsError    bool   `json:"is_error,omitempty"`     // true when tool returned an error
 }
 
 // MaxAgentSteps prevents infinite decision loops.
@@ -68,6 +69,7 @@ type DecidePrep struct {
 	RuntimeLine         string               // Phase 1: compact runtime info line
 	HasMCPIntent        bool                 // Phase 2: whether Problem mentions MCP/skill keywords
 	ContextWindowTokens int                  // Phase 2: model context window for token budget guard
+	LoopDetected        DetectionResult      // LoopDetector: repetitive pattern detection result
 }
 
 // Decision is the LLM's decision output.

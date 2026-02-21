@@ -66,6 +66,7 @@ func (n *DecideNode) Prep(state *AgentState) []DecidePrep {
 		RuntimeLine:         runtimeLine,
 		HasMCPIntent:        hasMCPIntent,
 		ContextWindowTokens: state.ContextWindowTokens,
+		LoopDetected:        (&LoopDetector{}).Check(state.StepHistory),
 	}}
 }
 
@@ -243,6 +244,11 @@ func (n *DecideNode) Post(state *AgentState, prep []DecidePrep, results ...Decis
 
 	switch decision.Action {
 	case "tool":
+		// LoopDetector hard override: if loop detected and LLM still chose tool, force answer
+		if len(prep) > 0 && prep[0].LoopDetected.Detected {
+			log.Printf("[LoopDetector] Hard override: tool → answer (%s)", prep[0].LoopDetected.Rule)
+			return core.ActionAnswer
+		}
 		return core.ActionTool
 	case "think":
 		// In native mode, model handles thinking internally.
@@ -435,6 +441,14 @@ func buildDecidePromptFC(prep DecidePrep) string {
 
 	sb.WriteString("请通过工具调用或直接文本回复来响应。")
 
+	// LoopDetector: inject warning into FC prompt
+	if prep.LoopDetected.Detected {
+		sb.WriteString(fmt.Sprintf(
+			"\n\n⚠️ 检测到重复操作模式（%s）。请直接用文本回复，不要调用工具。\n",
+			prep.LoopDetected.Description,
+		))
+	}
+
 	return sb.String()
 }
 
@@ -460,6 +474,14 @@ func buildDecidePrompt(prep DecidePrep) string {
 	remaining := MaxAgentSteps - prep.StepCount
 	if remaining <= 3 && prep.StepCount > 0 {
 		sb.WriteString(fmt.Sprintf("⚠️ 剩余步骤预算：%d。请尽快用已有信息给出 answer。\n\n", remaining))
+	}
+
+	// LoopDetector: inject warning into YAML prompt
+	if prep.LoopDetected.Detected {
+		sb.WriteString(fmt.Sprintf(
+			"⚠️ 检测到重复操作模式（%s）。请立即用已有信息给出 answer，不要再调用工具。\n\n",
+			prep.LoopDetected.Description,
+		))
 	}
 
 	// Dynamic YAML template based on thinking mode

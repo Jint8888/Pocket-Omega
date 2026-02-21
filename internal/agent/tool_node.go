@@ -101,6 +101,7 @@ func (n *ToolNodeImpl) Post(state *AgentState, prep []ToolPrep, results ...ToolE
 		Input:      string(p.Args),
 		Output:     output,
 		ToolCallID: p.ToolCallID,
+		IsError:    result.Error != "",
 	}
 	state.StepHistory = append(state.StepHistory, step)
 
