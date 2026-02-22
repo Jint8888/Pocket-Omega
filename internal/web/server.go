@@ -17,24 +17,26 @@ var content embed.FS
 
 // Server holds the HTTP server and its dependencies.
 type Server struct {
-	tmpl         *template.Template
-	mux          *http.ServeMux
-	chatHandler  *ChatHandler
-	agentHandler *AgentHandler // Phase 2: Agent with tools
+	tmpl           *template.Template
+	mux            *http.ServeMux
+	chatHandler    *ChatHandler
+	agentHandler   *AgentHandler   // Phase 2: Agent with tools
+	commandHandler *CommandHandler // Slash command handler
 }
 
-// NewServer creates a new web server with the given ChatHandler.
-func NewServer(chatHandler *ChatHandler, agentHandler *AgentHandler) (*Server, error) {
+// NewServer creates a new web server with the given handlers.
+func NewServer(chatHandler *ChatHandler, agentHandler *AgentHandler, commandHandler *CommandHandler) (*Server, error) {
 	tmpl, err := template.ParseFS(content, "templates/index.html")
 	if err != nil {
 		return nil, err
 	}
 
 	s := &Server{
-		tmpl:         tmpl,
-		mux:          http.NewServeMux(),
-		chatHandler:  chatHandler,
-		agentHandler: agentHandler,
+		tmpl:           tmpl,
+		mux:            http.NewServeMux(),
+		chatHandler:    chatHandler,
+		agentHandler:   agentHandler,
+		commandHandler: commandHandler,
 	}
 	s.registerRoutes()
 	return s, nil
@@ -46,6 +48,9 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/chat", s.chatHandler.HandleChat)
 	if s.agentHandler != nil {
 		s.mux.HandleFunc("/api/agent", s.agentHandler.HandleAgent)
+	}
+	if s.commandHandler != nil {
+		s.mux.HandleFunc("/api/command", s.commandHandler.HandleCommand)
 	}
 }
 

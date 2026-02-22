@@ -790,6 +790,17 @@
         .bubble-error .label {
             color: #f87171 !important;
         }
+
+        /* ── System command bubble ── */
+        .bubble-system {
+            border-left: 3px solid #6366f1;
+            background: rgba(99, 102, 241, 0.08);
+            white-space: pre-wrap;
+        }
+
+        .bubble-system .label {
+            color: #818cf8 !important;
+        }
     </style>
 </head>
 
@@ -858,6 +869,8 @@
             sessionStorage.setItem('omega_session_id', id)
             return id
         })()
+
+        const HEARTBEAT_TIMEOUT = 90_000; // 90s without SSE events = timeout
 
         const chatBox = document.getElementById('chat-container');
         const input = document.getElementById('msg-input');
@@ -1167,11 +1180,30 @@
             const text = input.value.trim();
             if (!text) return;
 
+            // Slash command interception — bypass LLM
+            if (text.startsWith('/')) {
+                input.value = '';
+                await handleCommand(text);
+                return;
+            }
+
             input.value = '';
             currentController = new AbortController();
             setRunning(true);
             addUserMsg(text);
             addLoading();
+
+            let heartbeatTimer = null;
+            let receivedDone = false;
+            let heartbeatFired = false;
+
+            function resetHeartbeat() {
+                clearTimeout(heartbeatTimer);
+                heartbeatTimer = setTimeout(() => {
+                    heartbeatFired = true;
+                    if (currentController) currentController.abort('timeout');
+                }, HEARTBEAT_TIMEOUT);
+            }
 
             try {
                 const formData = new FormData();
@@ -1179,6 +1211,8 @@
                 formData.append('session_id', SESSION_ID);
 
                 const endpoint = isAgentMode() ? '/api/agent' : '/api/chat';
+
+                resetHeartbeat(); // start initial heartbeat timer
 
                 const resp = await fetch(endpoint, {
                     method: 'POST',
@@ -1191,6 +1225,7 @@
                 const decoder = new TextDecoder();
 
                 const parseSSE = createSSEParser(function (event, data) {
+                    resetHeartbeat(); // reset on every SSE event
                     try {
                         const parsed = JSON.parse(data);
                         if (event === 'status') {
@@ -1208,6 +1243,7 @@
                         } else if (event === 'plan') {
                             renderPlanProgress(parsed.steps || []);
                         } else if (event === 'done') {
+                            receivedDone = true;
                             removeLoading();
                             finalizeThinkingBox();
                             finalizeAgentBox();
@@ -1224,20 +1260,68 @@
                     parseSSE(decoder.decode(value, { stream: true }));
                 }
 
+                // Stream close fallback: connection closed without done event
+                if (!receivedDone) {
+                    removeLoading();
+                    finalizeThinkingBox();
+                    finalizeAgentBox();
+                    addAiMsg('⚠️ 连接已断开，请重试', true);
+                }
+
             } catch (err) {
                 removeLoading();
                 finalizeThinkingBox();
                 finalizeAgentBox();
                 if (err.name === 'AbortError') {
-                    addAiMsg('⏹ 已停止', false);
+                    // Differentiate user stop vs heartbeat timeout
+                    addAiMsg(heartbeatFired ? '⏱ 响应超时，已自动恢复输入' : '⏹ 已停止', false);
                 } else {
                     addAiMsg('请求失败: ' + err.message, true);
                 }
             } finally {
+                clearTimeout(heartbeatTimer);
+                heartbeatTimer = null;
                 currentController = null;
                 setRunning(false);
                 input.focus();
             }
+        }
+
+        async function handleCommand(text) {
+            const parts = text.slice(1).split(/\s+/);
+            const cmd = parts[0].toLowerCase();
+            const args = parts.slice(1).join(' ');
+            addUserMsg(text);
+            try {
+                const resp = await fetch('/api/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: cmd, args: args, session_id: SESSION_ID })
+                });
+                const data = await resp.json();
+                if (data.action === 'clear_chat') {
+                    chatBox.innerHTML = '<div class="welcome-msg">' +
+                        '<div class="welcome-avatar">Ω</div>' +
+                        '<div class="welcome-title">你好！ 👋</div>' +
+                        '<div class="welcome-sub">对话已清空。输入问题开始新对话。</div></div>';
+                }
+                addSystemMsg(data.ok ? data.message : '❌ ' + data.message);
+            } catch (err) {
+                addSystemMsg('❌ 命令执行失败: ' + err.message);
+            }
+        }
+
+        function addSystemMsg(text) {
+            const div = document.createElement('div');
+            div.className = 'msg msg-ai';
+            div.innerHTML = '<div class="msg-ai-wrapper">' +
+                '<div class="ai-avatar">⚙</div>' +
+                '<div class="bubble bubble-ai bubble-system">' +
+                '<div class="label">系统</div>' +
+                escapeHtml(text) +
+                '</div></div>';
+            chatBox.appendChild(div);
+            scrollBottom();
         }
     </script>
 </body>

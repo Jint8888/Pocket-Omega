@@ -253,10 +253,6 @@ func (m *mockLLMProvider) IsToolCallingEnabled() bool {
 	return m.supportsFC
 }
 
-func (m *mockLLMProvider) GetName() string {
-	return "mock"
-}
-
 // ── FC path tests ──
 
 func TestExecWithFC_ToolCallReturned(t *testing.T) {
@@ -673,37 +669,6 @@ func TestTokenBudgetGuard_UTF8Safe(t *testing.T) {
 		if r == '\uFFFD' {
 			t.Errorf("invalid UTF-8 replacement char at position %d in truncated result", i)
 		}
-	}
-}
-
-// ── Decision.Headline YAML parsing tests ──
-
-func TestParseDecision_WithHeadline(t *testing.T) {
-	input := "```yaml\naction: tool\nreason: listing files\nheadline: 正在列出目录...\ntool_name: file_list\ntool_params:\n  path: .\n```"
-	decision, err := parseDecision(input)
-	if err != nil {
-		t.Fatalf("parseDecision() error: %v", err)
-	}
-	if decision.Action != "tool" {
-		t.Errorf("Action = %q, want %q", decision.Action, "tool")
-	}
-	if decision.Headline != "正在列出目录..." {
-		t.Errorf("Headline = %q, want %q", decision.Headline, "正在列出目录...")
-	}
-	if decision.ToolName != "file_list" {
-		t.Errorf("ToolName = %q, want %q", decision.ToolName, "file_list")
-	}
-}
-
-func TestParseDecision_HeadlineOmitEmpty(t *testing.T) {
-	// headline field absent → Decision.Headline should be empty string (zero value)
-	input := "action: answer\nreason: simple\nanswer: hello"
-	decision, err := parseDecision(input)
-	if err != nil {
-		t.Fatalf("parseDecision() error: %v", err)
-	}
-	if decision.Headline != "" {
-		t.Errorf("Headline = %q, want empty string when omitted", decision.Headline)
 	}
 }
 

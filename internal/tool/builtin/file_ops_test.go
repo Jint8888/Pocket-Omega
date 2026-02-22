@@ -794,3 +794,354 @@ func TestRelOrAbs(t *testing.T) {
 		t.Errorf("relOrAbs = %q, want %q", rel, filepath.Join("sub", "file.txt"))
 	}
 }
+
+// ── Stage 2: Whitespace-Normalized Matching ─────────────────────────────────
+
+func TestFilePatch_Stage2_IndentDiff(t *testing.T) {
+	workspace := t.TempDir()
+	os.WriteFile(filepath.Join(workspace, "test.go"), []byte("func main() {\n\tfmt.Println(\"hello\")\n}\n"), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.go",
+		StartLine:       2,
+		EndLine:         2,
+		Content:         "\tfmt.Println(\"world\")\n",
+		ExpectedContent: "    fmt.Println(\"hello\")\n", // spaces instead of tab
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Errorf("Stage 2 should match despite indent diff, got error: %s", result.Error)
+	}
+}
+
+func TestFilePatch_Stage2_TrailingSpace(t *testing.T) {
+	workspace := t.TempDir()
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte("hello\nworld\n"), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.txt",
+		StartLine:       1,
+		EndLine:         1,
+		Content:         "hi\n",
+		ExpectedContent: "hello   \n", // trailing spaces
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Errorf("Stage 2 should match despite trailing space, got error: %s", result.Error)
+	}
+}
+
+func TestFilePatch_Stage2_TabVsSpace(t *testing.T) {
+	workspace := t.TempDir()
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte("\tindented\n"), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.txt",
+		StartLine:       1,
+		EndLine:         1,
+		Content:         "  new\n",
+		ExpectedContent: "    indented\n", // spaces instead of tab
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Errorf("Stage 2 should match tab vs space, got error: %s", result.Error)
+	}
+}
+
+func TestFilePatch_Stage2_EmptyLinePreserve(t *testing.T) {
+	workspace := t.TempDir()
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte("a\n\nb\n"), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.txt",
+		StartLine:       1,
+		EndLine:         3,
+		Content:         "x\ny\nz\n",
+		ExpectedContent: "  a\n\n  b\n", // same structure, different indent
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Errorf("Stage 2 should match when empty lines align, got error: %s", result.Error)
+	}
+}
+
+func TestFilePatch_Stage2_EmptyLineMismatch(t *testing.T) {
+	workspace := t.TempDir()
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte("a\n\nb\n"), 0644) // 3 lines
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.txt",
+		StartLine:       1,
+		EndLine:         3,
+		Content:         "x\ny\n",
+		ExpectedContent: "a\nb\n", // 2 lines — mismatch (file has 3)
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error == "" {
+		t.Error("Stage 2 should fail when line count differs")
+	}
+}
+
+func TestFilePatch_Stage2_ContentMismatch(t *testing.T) {
+	workspace := t.TempDir()
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte("hello\n"), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.txt",
+		StartLine:       1,
+		EndLine:         1,
+		Content:         "new\n",
+		ExpectedContent: "totally different\n",
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error == "" || !strings.Contains(result.Error, "内容不匹配") {
+		t.Errorf("Stage 2 should fail for real content diff, got: %+v", result)
+	}
+}
+
+// ── Stage 3: Context-Based Relocation ───────────────────────────────────────
+
+func TestFilePatch_Stage3_LineShift(t *testing.T) {
+	workspace := t.TempDir()
+	// Lines were shifted: original target was L2-L3, but 2 lines were inserted before
+	content := "inserted1\ninserted2\nline1\nTARGET_A\nTARGET_B\nline4\n"
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte(content), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.txt",
+		StartLine:       2, // old position — wrong now
+		EndLine:         3,
+		Content:         "NEW_A\nNEW_B\n",
+		ExpectedContent: "wrong content for stage 1+2",
+		ContextBefore:   "line1\n",
+		ContextAfter:    "line4\n",
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Errorf("Stage 3 should relocate and succeed, got error: %s", result.Error)
+	}
+	got, _ := os.ReadFile(filepath.Join(workspace, "test.txt"))
+	if !strings.Contains(string(got), "NEW_A\nNEW_B\n") {
+		t.Errorf("file should contain replaced content, got: %q", got)
+	}
+}
+
+func TestFilePatch_Stage3_NoContext(t *testing.T) {
+	workspace := t.TempDir()
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte("line1\nline2\n"), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.txt",
+		StartLine:       1,
+		EndLine:         1,
+		Content:         "new\n",
+		ExpectedContent: "wrong\n",
+		// No context_before or context_after
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error == "" || !strings.Contains(result.Error, "内容不匹配") {
+		t.Errorf("should fail without context, got: %+v", result)
+	}
+}
+
+func TestFilePatch_Stage3_Ambiguous(t *testing.T) {
+	workspace := t.TempDir()
+	// Duplicate structure — context matches two positions
+	content := "header\nTARGET\nfooter\nheader\nTARGET\nfooter\n"
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte(content), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.txt",
+		StartLine:       2,
+		EndLine:         2,
+		Content:         "NEW\n",
+		ExpectedContent: "wrong\n",
+		ContextBefore:   "header\n",
+		ContextAfter:    "footer\n",
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error == "" || !strings.Contains(result.Error, "歧义") {
+		t.Errorf("should report ambiguity, got: %+v", result)
+	}
+}
+
+func TestFilePatch_Stage3_NotFound(t *testing.T) {
+	workspace := t.TempDir()
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte("aaa\nbbb\nccc\n"), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.txt",
+		StartLine:       1,
+		EndLine:         1,
+		Content:         "new\n",
+		ExpectedContent: "wrong\n",
+		ContextBefore:   "nonexistent_line\n",
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error == "" || !strings.Contains(result.Error, "未找到") {
+		t.Errorf("should report not found, got: %+v", result)
+	}
+}
+
+func TestFilePatch_Stage3_OnlyBefore(t *testing.T) {
+	workspace := t.TempDir()
+	// 4-line file: anchor is unique context before TARGET
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte("other1\nanchor\nTARGET\nother2\n"), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.txt",
+		StartLine:       1, // wrong position, but within bounds
+		EndLine:         1,
+		Content:         "NEW\n",
+		ExpectedContent: "wrong\n",
+		ContextBefore:   "anchor\n",
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Errorf("Stage 3 with only context_before should succeed, got: %s", result.Error)
+	}
+	got, _ := os.ReadFile(filepath.Join(workspace, "test.txt"))
+	if !strings.Contains(string(got), "NEW\n") {
+		t.Errorf("replacement should have been applied, got: %q", got)
+	}
+}
+
+func TestFilePatch_Stage3_OnlyAfter(t *testing.T) {
+	workspace := t.TempDir()
+	// 4-line file: anchor is unique context after TARGET
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte("other1\nTARGET\nanchor\nother2\n"), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.txt",
+		StartLine:       4, // wrong position, but within bounds
+		EndLine:         4,
+		Content:         "NEW\n",
+		ExpectedContent: "wrong\n",
+		ContextAfter:    "anchor\n",
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Errorf("Stage 3 with only context_after should succeed, got: %s", result.Error)
+	}
+	got, _ := os.ReadFile(filepath.Join(workspace, "test.txt"))
+	if !strings.Contains(string(got), "NEW\n") {
+		t.Errorf("replacement should have been applied, got: %q", got)
+	}
+}
+
+// ── Regression: existing behavior preserved ─────────────────────────────────
+
+func TestFilePatch_Stage1_ExactMatch(t *testing.T) {
+	workspace := t.TempDir()
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte("hello\nworld\n"), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:            "test.txt",
+		StartLine:       1,
+		EndLine:         1,
+		Content:         "hi\n",
+		ExpectedContent: "hello\n",
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Errorf("Stage 1 exact match should succeed, got: %s", result.Error)
+	}
+	got, _ := os.ReadFile(filepath.Join(workspace, "test.txt"))
+	if string(got) != "hi\nworld\n" {
+		t.Errorf("file content = %q, want %q", got, "hi\nworld\n")
+	}
+}
+
+func TestFilePatch_NoExpectedContent(t *testing.T) {
+	workspace := t.TempDir()
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte("a\nb\nc\n"), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:      "test.txt",
+		StartLine: 2,
+		EndLine:   2,
+		Content:   "X\n",
+		// No expected_content — skip all matching
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Errorf("should succeed without expected_content, got: %s", result.Error)
+	}
+	got, _ := os.ReadFile(filepath.Join(workspace, "test.txt"))
+	if string(got) != "a\nX\nc\n" {
+		t.Errorf("file content = %q, want %q", got, "a\nX\nc\n")
+	}
+}
+
+func TestFilePatch_BackwardCompat(t *testing.T) {
+	// Ensure old-style args without context_before/context_after still work
+	workspace := t.TempDir()
+	os.WriteFile(filepath.Join(workspace, "test.txt"), []byte("line1\nline2\n"), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	// Raw JSON without new fields
+	args := []byte(`{"path":"test.txt","start_line":1,"end_line":1,"content":"new\n","expected_content":"line1\n"}`)
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Errorf("backward compat should work, got: %s", result.Error)
+	}
+}

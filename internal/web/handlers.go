@@ -226,12 +226,12 @@ func (h *ChatHandler) HandleChat(w http.ResponseWriter, r *http.Request) {
 	sessionID := strings.TrimSpace(r.FormValue("session_id"))
 	var historyMsgs []llm.Message
 	if sessionID != "" && h.sessionStore != nil {
-		turns := h.sessionStore.GetHistory(sessionID)
+		turns, summary := h.sessionStore.GetSessionContext(sessionID)
 		// Allocate 50% of context window (in chars) to chat history.
 		// More generous than Agent's 30% since Chat has no tool output overhead.
 		// When contextWindowTokens is 0 (unknown), budget is 0 (no cap).
 		budget := h.contextWindowTokens * 2 * 50 / 100
-		historyMsgs = session.ToMessages(turns, budget)
+		historyMsgs = session.ToMessages(turns, budget, summary)
 	}
 
 	sse := newSSEWriter(w, r)
@@ -306,6 +306,8 @@ type AgentHandlerOptions struct {
 	ShellCmd            string               // e.g. "cmd.exe /c" — for runtime info line
 	ModelName           string               // e.g. "gemini-2.5-pro" — for runtime info line
 	PlanStore           *plan.PlanStore      // optional — enables update_plan tool
+	MaxAgentTokens      int64                // 0 = disabled; CostGuard token budget
+	MaxAgentDuration    time.Duration        // 0 = disabled; CostGuard time limit
 }
 
 // AgentHandler handles agent requests with tool usage capability.
@@ -324,6 +326,8 @@ type AgentHandler struct {
 	shellCmd            string
 	modelName           string
 	planStore           *plan.PlanStore
+	maxAgentTokens      int64
+	maxAgentDuration    time.Duration
 }
 
 // NewAgentHandler creates a new agent handler from AgentHandlerOptions.
@@ -343,6 +347,8 @@ func NewAgentHandler(opts AgentHandlerOptions) *AgentHandler {
 		shellCmd:            opts.ShellCmd,
 		modelName:           opts.ModelName,
 		planStore:           opts.PlanStore,
+		maxAgentTokens:      opts.MaxAgentTokens,
+		maxAgentDuration:    opts.MaxAgentDuration,
 	}
 }
 
@@ -371,10 +377,10 @@ func (h *AgentHandler) HandleAgent(w http.ResponseWriter, r *http.Request) {
 	sessionID := strings.TrimSpace(r.FormValue("session_id"))
 	var historyPrefix string
 	if sessionID != "" && h.sessionStore != nil {
-		turns := h.sessionStore.GetHistory(sessionID)
+		turns, summary := h.sessionStore.GetSessionContext(sessionID)
 		// allocate 30% of context window (in chars) to conversation history
 		budget := h.contextWindowTokens * 2 * 30 / 100
-		historyPrefix = session.ToProblemPrefix(turns, budget)
+		historyPrefix = session.ToProblemPrefix(turns, budget, summary)
 	}
 
 	sse := newSSEWriter(w, r)
@@ -436,6 +442,29 @@ func (h *AgentHandler) HandleAgent(w http.ResponseWriter, r *http.Request) {
 		OnStreamChunk: func(chunk string) {
 			sse.Send("chunk", map[string]string{"text": chunk})
 		},
+	}
+
+	// CostGuard: inject if configured
+	if h.maxAgentTokens > 0 || h.maxAgentDuration > 0 {
+		state.CostGuard = agent.NewCostGuard(h.maxAgentTokens, h.maxAgentDuration)
+	}
+
+	// ContextGuard: inject OnContextOverflow callback for auto-compact
+	if sessionID != "" && h.sessionStore != nil && h.llmProvider != nil {
+		sessID := sessionID // capture for closure
+		state.OnContextOverflow = func(ctx context.Context) error {
+			turns, existing := h.sessionStore.GetSessionContext(sessID)
+			if len(turns) <= defaultCompactKeepN {
+				return nil
+			}
+			summary, err := buildCompactSummary(ctx, h.llmProvider, turns, existing, defaultCompactKeepN)
+			if err != nil {
+				return err
+			}
+			h.sessionStore.Compact(sessID, summary, defaultCompactKeepN)
+			log.Printf("[ContextGuard] Auto-compact done for session=%s", sessID)
+			return nil
+		}
 	}
 
 	// Run the agent flow with timeout context

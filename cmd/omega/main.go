@@ -154,6 +154,7 @@ func main() {
 	promptLoader.PatchFile("knowledge.md", "{{SHELL_CMD}}", shellCmd)
 
 	// Initialize MCP client manager (optional — only when mcp.json exists)
+	var mcpReloadFn func() // captured from MCP block for /reload command
 	mcpConfigPath := os.Getenv("MCP_CONFIG")
 	if mcpConfigPath == "" {
 		mcpConfigPath = filepath.Join(workspaceDir, "mcp.json")
@@ -198,6 +199,13 @@ func main() {
 		// Inject runtime probe result into mcp_server_guide.md so agents read
 		// the live status rather than discovering it themselves.
 		injectRuntimeEnv(promptLoader, nodeInfo.StatusString())
+
+		mcpReloadFn = func() {
+			_, err := mcpMgr.Reload(context.Background(), registry)
+			if err != nil {
+				log.Printf("[Reload] MCP reload error: %v", err)
+			}
+		}
 	}
 
 	// Create execution logger for development debugging
@@ -242,6 +250,20 @@ func main() {
 	toolCallMode := llmClient.GetConfig().ToolCallMode // raw value: "auto", "fc", or "yaml"
 	contextWindow := llmClient.GetConfig().ResolveContextWindow()
 	chatHandler := web.NewChatHandler(llmClient, 3, contextWindow, sessionStore, promptLoader)
+	// CostGuard configuration
+	var maxAgentTokens int64
+	if v := os.Getenv("AGENT_MAX_TOKENS"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			maxAgentTokens = n
+		}
+	}
+	var maxAgentDuration time.Duration
+	if v := os.Getenv("AGENT_MAX_DURATION_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			maxAgentDuration = time.Duration(n) * time.Minute
+		}
+	}
+
 	agentHandler := web.NewAgentHandler(web.AgentHandlerOptions{
 		Provider:            llmClient,
 		Registry:            registry,
@@ -256,13 +278,23 @@ func main() {
 		ShellCmd:            shellCmd,
 		ModelName:           llmClient.GetConfig().Model,
 		PlanStore:           planStore,
+		MaxAgentTokens:      maxAgentTokens,
+		MaxAgentDuration:    maxAgentDuration,
 	})
 	fmt.Printf("🧠 Thinking: %s\n", thinkingMode)
 	fmt.Printf("🔧 ToolCall: %s (resolved: %s)\n", toolCallMode, llmClient.GetConfig().ResolveToolCallMode())
 	fmt.Printf("📐 ContextWindow: %d tokens\n", contextWindow)
 
+	// Create slash command handler (/compact needs LLM for summary generation)
+	commandHandler := web.NewCommandHandler(web.CommandHandlerOptions{
+		Loader:      promptLoader,
+		MCPReload:   mcpReloadFn, // nil-safe: cmdReload checks for nil
+		Store:       sessionStore,
+		LLMProvider: llmClient,
+	})
+
 	// Create and start web server
-	server, err := web.NewServer(chatHandler, agentHandler)
+	server, err := web.NewServer(chatHandler, agentHandler, commandHandler)
 	if err != nil {
 		log.Fatalf("❌ Failed to create web server: %v", err)
 	}

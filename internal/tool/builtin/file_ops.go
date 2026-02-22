@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -309,6 +310,8 @@ func (t *FilePatchTool) InputSchema() json.RawMessage {
 		tool.SchemaParam{Name: "end_line", Type: "integer", Description: "结束行号（含）", Required: true},
 		tool.SchemaParam{Name: "content", Type: "string", Description: "替换后的新内容（可多行；传入空字符串 \"\" 表示删除该行范围）", Required: true},
 		tool.SchemaParam{Name: "expected_content", Type: "string", Description: "预期被替换的原始内容（可选）；传入时若不匹配则拒绝执行", Required: false},
+		tool.SchemaParam{Name: "context_before", Type: "string", Description: "（可选）目标块前 1-3 行的原始内容，用于上下文定位；仅在 expected_content 匹配失败时使用", Required: false},
+		tool.SchemaParam{Name: "context_after", Type: "string", Description: "（可选）目标块后 1-3 行的原始内容，用于上下文定位；仅在 expected_content 匹配失败时使用", Required: false},
 	)
 }
 
@@ -321,6 +324,8 @@ type filePatchArgs struct {
 	EndLine         int    `json:"end_line"`
 	Content         string `json:"content"`
 	ExpectedContent string `json:"expected_content"`
+	ContextBefore   string `json:"context_before,omitempty"`
+	ContextAfter    string `json:"context_after,omitempty"`
 }
 
 func (t *FilePatchTool) Execute(_ context.Context, args json.RawMessage) (tool.ToolResult, error) {
@@ -382,14 +387,34 @@ func (t *FilePatchTool) Execute(_ context.Context, args json.RawMessage) (tool.T
 		return tool.ToolResult{Error: fmt.Sprintf("end_line %d 超出文件实际行数 %d — 请重新 file_read 后再编辑", a.EndLine, totalLines)}, nil
 	}
 
-	// Optimistic locking: verify expected_content when provided.
-	// Normalize line endings (\r\n → \n) before comparison to handle
-	// cross-platform differences between LLM output and file content.
+	// Three-stage matching when expected_content is provided.
+	// Stage 1: exact match (\r\n normalized)
+	// Stage 2: whitespace-normalized match (TrimSpace per line)
+	// Stage 3: context-based relocation (context_before/context_after)
 	if a.ExpectedContent != "" {
 		actual := strings.Join(lines[a.StartLine-1:a.EndLine], "")
 		normalize := func(s string) string { return strings.ReplaceAll(s, "\r\n", "\n") }
+
+		// Stage 1: exact match
 		if normalize(actual) != normalize(a.ExpectedContent) {
-			return tool.ToolResult{Error: "内容不匹配，文件可能已被修改，请重新 file_read 后再编辑"}, nil
+			// Stage 2: whitespace-normalized match
+			if matchStage2(actual, a.ExpectedContent) {
+				log.Printf("[file_patch:stage2] whitespace-normalized match: %s L%d-%d", a.Path, a.StartLine, a.EndLine)
+			} else {
+				// Stage 3: context-based relocation
+				if a.ContextBefore != "" || a.ContextAfter != "" {
+					expectedLen := a.EndLine - a.StartLine + 1
+					newStart, newEnd, locErr := locateByContext(lines, expectedLen, a.ContextBefore, a.ContextAfter)
+					if locErr != nil {
+						return tool.ToolResult{Error: fmt.Sprintf("内容不匹配，上下文定位也失败: %v", locErr)}, nil
+					}
+					log.Printf("[file_patch:stage3] context-locate match: %s L%d-%d → L%d-%d", a.Path, a.StartLine, a.EndLine, newStart, newEnd)
+					a.StartLine = newStart
+					a.EndLine = newEnd
+				} else {
+					return tool.ToolResult{Error: "内容不匹配（已尝试精确/空白归一化匹配）。建议：1) 重新 file_read 获取最新内容；2) 提供 context_before/context_after 辅助定位"}, nil
+				}
+			}
 		}
 	}
 
@@ -433,4 +458,98 @@ func splitLines(s string) []string {
 		lines = append(lines, s[start:])
 	}
 	return lines
+}
+
+// ── Three-stage matching helpers ─────────────────────────────────────────────
+
+// splitNormalized normalizes line endings and splits into lines.
+// Each element does NOT include the trailing newline.
+// Empty lines are preserved — they are part of code structure.
+func splitNormalized(s string) []string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.TrimSuffix(s, "\n") // strip one trailing newline to avoid phantom empty line
+	if s == "" {
+		return nil
+	}
+	return strings.Split(s, "\n")
+}
+
+// matchStage2 compares actual and expected content with whitespace normalization.
+// Lines are split preserving empty lines, then each line is TrimSpace'd before comparison.
+// Line count must be strictly equal.
+func matchStage2(actual, expected string) bool {
+	aLines := splitNormalized(actual)
+	eLines := splitNormalized(expected)
+	if len(aLines) != len(eLines) {
+		return false
+	}
+	for i := range aLines {
+		if strings.TrimSpace(aLines[i]) != strings.TrimSpace(eLines[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// nonEmptyTrimmed splits text into non-empty trimmed lines.
+// Used by Stage 3 context matching where empty lines in context are noise.
+func nonEmptyTrimmed(s string) []string {
+	var result []string
+	for _, line := range strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			result = append(result, t)
+		}
+	}
+	return result
+}
+
+// matchContext checks if the lines starting at position `start` match the context lines
+// (TrimSpace comparison). Each context line is already trimmed by nonEmptyTrimmed.
+func matchContext(lines []string, start int, ctx []string) bool {
+	if len(ctx) == 0 {
+		return true
+	}
+	if start < 0 || start+len(ctx) > len(lines) {
+		return false
+	}
+	for i, c := range ctx {
+		if strings.TrimSpace(lines[start+i]) != c {
+			return false
+		}
+	}
+	return true
+}
+
+// locateByContext searches the file for a unique position where context_before and
+// context_after both match, then returns the new line range (1-indexed).
+// expectedLen is the original line range size (endLine - startLine + 1).
+func locateByContext(lines []string, expectedLen int, ctxBefore, ctxAfter string) (startLine, endLine int, err error) {
+	if expectedLen < 1 {
+		return 0, 0, fmt.Errorf("expectedLen must be >= 1, got %d", expectedLen)
+	}
+	beforeLines := nonEmptyTrimmed(ctxBefore)
+	afterLines := nonEmptyTrimmed(ctxAfter)
+	if len(beforeLines) == 0 && len(afterLines) == 0 {
+		return 0, 0, fmt.Errorf("context_before 和 context_after 均为空，无法定位")
+	}
+
+	// lines here uses splitLines which preserves line endings in each element.
+	// We need to iterate using 0-indexed positions.
+	var candidates []int
+	for i := len(beforeLines); i <= len(lines)-expectedLen-len(afterLines); i++ {
+		if matchContext(lines, i-len(beforeLines), beforeLines) &&
+			matchContext(lines, i+expectedLen, afterLines) {
+			candidates = append(candidates, i)
+		}
+	}
+
+	switch len(candidates) {
+	case 0:
+		return 0, 0, fmt.Errorf("上下文未找到匹配位置")
+	case 1:
+		s := candidates[0] + 1 // 1-indexed
+		return s, s + expectedLen - 1, nil
+	default:
+		return 0, 0, fmt.Errorf("上下文匹配到 %d 个位置（歧义），请提供更多 context_before/context_after", len(candidates))
+	}
 }

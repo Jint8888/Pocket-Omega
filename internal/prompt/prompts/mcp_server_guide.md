@@ -40,7 +40,47 @@ Step 4  执行依赖安装（TypeScript: npm install；Python: 用户手动 pip 
 Step 5  调用 mcp_server_add 注册到 mcp.json
 Step 6  调用 mcp_reload 热加载
 Step 7  调用新工具验证功能
-Step 8  回报完成
+Step 8  创建 skills/<name>/README.md 使用说明文档（模板见下方）
+Step 9  回报完成
+```
+
+---
+
+## README.md 模板（Step 8 必须创建）
+
+Agent 验证工具功能后，**必须**用 `file_write` 创建 `skills/<name>/README.md`：
+
+```markdown
+# <server-name>
+
+> 一句话描述此 MCP Server 的用途。
+
+## 工具列表
+
+### `tool_name_1`
+
+**用途**：简要描述工具功能。
+
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| param1 | string | ✅ | 参数描述 |
+| param2 | number | ❌ | 参数描述（默认值：0） |
+
+**示例调用**：
+```
+tool_name_1(param1="example", param2=5)
+```
+
+**返回格式**：描述返回值的结构和含义。
+
+## 依赖
+
+- 运行时：Python 3.x / Node.js / Go
+- 关键依赖：列出主要第三方库
+
+## 注意事项
+
+- 已知限制、常见错误、性能注意点
 ```
 
 ---
@@ -222,3 +262,4 @@ lifecycle="persistent"
 - [ ] mcp_server_add 注册成功（无冲突错误）
 - [ ] mcp_reload 返回成功，工具已出现在工具列表
 - [ ] 调用工具验证功能正常
+- [ ] README.md 已创建，包含工具列表、参数说明和示例

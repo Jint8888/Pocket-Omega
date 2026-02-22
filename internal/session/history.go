@@ -12,14 +12,15 @@ import (
 // It trims the oldest turns until the total character count is within budget.
 // budget == 0 means no limit (use with caution).
 // At least the most recent turn is always included, even when it exceeds the budget.
-func ToMessages(turns []Turn, budget int) []llm.Message {
-	if len(turns) == 0 {
+// If summary is provided, it is prepended as a RoleSystem message.
+func ToMessages(turns []Turn, budget int, summary ...string) []llm.Message {
+	if len(turns) == 0 && (len(summary) == 0 || summary[0] == "") {
 		return nil
 	}
 
 	start := 0 // first turn index to include
 
-	if budget > 0 {
+	if budget > 0 && len(turns) > 0 {
 		// Walk newest-to-oldest, accumulating char count
 		total := 0
 		for i := len(turns) - 1; i >= 0; i-- {
@@ -36,7 +37,16 @@ func ToMessages(turns []Turn, budget int) []llm.Message {
 		}
 	}
 
-	msgs := make([]llm.Message, 0, (len(turns)-start)*2)
+	var msgs []llm.Message
+
+	// Prepend summary as system context (not RoleUser — it's historical context)
+	if len(summary) > 0 && summary[0] != "" {
+		msgs = append(msgs, llm.Message{
+			Role:    llm.RoleSystem,
+			Content: "[对话历史摘要]\n" + summary[0],
+		})
+	}
+
 	for _, t := range turns[start:] {
 		msgs = append(msgs,
 			llm.Message{Role: llm.RoleUser, Content: t.UserMsg},
@@ -48,15 +58,31 @@ func ToMessages(turns []Turn, budget int) []llm.Message {
 
 // ToProblemPrefix formats history as a plain-text context preamble,
 // used by Agent mode to prepend conversation context to the Problem field.
-func ToProblemPrefix(turns []Turn, budget int) string {
-	if len(turns) == 0 {
+// If summary is provided, it is prepended before the turn history.
+func ToProblemPrefix(turns []Turn, budget int, summary ...string) string {
+	hasSummary := len(summary) > 0 && summary[0] != ""
+	if len(turns) == 0 && !hasSummary {
 		return ""
 	}
-	msgs := ToMessages(turns, budget)
-	if len(msgs) == 0 {
-		return ""
-	}
+
 	var sb strings.Builder
+
+	// Summary comes before turn history
+	if hasSummary {
+		sb.WriteString("[对话历史摘要]\n")
+		sb.WriteString(summary[0])
+		sb.WriteString("\n\n")
+	}
+
+	if len(turns) == 0 {
+		return sb.String()
+	}
+
+	msgs := ToMessages(turns, budget) // no summary here — already injected above
+	if len(msgs) == 0 {
+		return sb.String()
+	}
+
 	sb.WriteString("[对话历史]\n")
 	round := 1
 	for i := 0; i+1 < len(msgs); i += 2 {

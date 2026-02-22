@@ -1,6 +1,11 @@
 package agent
 
 import (
+	"context"
+	"log"
+	"os"
+	"strconv"
+
 	"github.com/pocketomega/pocket-omega/internal/llm"
 	"github.com/pocketomega/pocket-omega/internal/tool"
 )
@@ -31,6 +36,12 @@ type AgentState struct {
 	// Solves node-to-node state passing.
 	LastDecision *Decision `json:"-"`
 
+	// Guardrail fields
+	LoopDetectionStreak int                             `json:"-"` // consecutive loop detections without self-correction
+	CostGuard           *CostGuard                      `json:"-"` // nil = disabled; enforces token/duration limits
+	pendingCompact      bool                            // single-goroutine: set by Post (from Decision.ContextStatus), consumed in Post
+	OnContextOverflow   func(ctx context.Context) error `json:"-"` // injected by AgentHandler
+
 	// SSE callbacks
 	OnStepComplete func(StepRecord)   `json:"-"`
 	OnStreamChunk  func(chunk string) `json:"-"` // LLM streaming token callback
@@ -49,7 +60,24 @@ type StepRecord struct {
 }
 
 // MaxAgentSteps prevents infinite decision loops.
-const MaxAgentSteps = 24
+// Configurable via AGENT_MAX_STEPS env var (default: 40, min: 5, max: 200).
+var MaxAgentSteps = loadMaxSteps()
+
+// loadMaxSteps reads AGENT_MAX_STEPS from the environment.
+// Extracted as a standalone function to allow direct unit testing.
+func loadMaxSteps() int {
+	const defaultSteps = 40
+	v := os.Getenv("AGENT_MAX_STEPS")
+	if v == "" {
+		return defaultSteps
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 5 || n > 200 {
+		log.Printf("[Config] WARNING: invalid AGENT_MAX_STEPS=%q (must be 5-200), using default %d", v, defaultSteps)
+		return defaultSteps
+	}
+	return n
+}
 
 // ── DecideNode generic types ──
 // BaseNode[AgentState, DecidePrep, Decision]
@@ -70,20 +98,22 @@ type DecidePrep struct {
 	HasMCPIntent        bool                 // Phase 2: whether Problem mentions MCP/skill keywords
 	ContextWindowTokens int                  // Phase 2: model context window for token budget guard
 	LoopDetected        DetectionResult      // LoopDetector: repetitive pattern detection result
+	CostGuard           *CostGuard           // pointer shared with state for Exec to record tokens
+	SystemPromptEst     int                  // estimated system prompt tokens (computed in Prep)
 }
 
 // Decision is the LLM's decision output.
 // In YAML mode: parsed from YAML text. In FC mode: extracted from tool_calls.
 // ToolParams uses map[string]any; converted to json.RawMessage before calling Tool.Execute().
 type Decision struct {
-	Action     string         `yaml:"action"`             // "tool", "think", "answer"
-	Reason     string         `yaml:"reason"`             // Reasoning for this decision
-	Headline   string         `yaml:"headline,omitempty"` // Optional: user-visible operation summary
-	ToolName   string         `yaml:"tool_name"`          // Required when action=tool
-	ToolParams map[string]any `yaml:"tool_params"`        // YAML-friendly, json.Marshal before tool call
-	Thinking   string         `yaml:"thinking"`           // Used when action=think
-	Answer     string         `yaml:"answer"`             // Used when action=answer
-	ToolCallID string         `yaml:"-"`                  // FC only: tool call ID for result correlation
+	Action        string         `yaml:"action"`      // "tool", "think", "answer"
+	Reason        string         `yaml:"reason"`      // Reasoning for this decision
+	ToolName      string         `yaml:"tool_name"`   // Required when action=tool
+	ToolParams    map[string]any `yaml:"tool_params"` // YAML-friendly, json.Marshal before tool call
+	Thinking      string         `yaml:"thinking"`    // Used when action=think
+	Answer        string         `yaml:"answer"`      // Used when action=answer
+	ToolCallID    string         `yaml:"-"`           // FC only: tool call ID for result correlation
+	ContextStatus ContextStatus  `yaml:"-"`           // set by Exec when context window is filling up
 }
 
 // ── ToolNode generic types ──

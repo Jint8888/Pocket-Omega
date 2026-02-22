@@ -7,12 +7,11 @@ import (
 
 // Message represents a chat message for LLM communication.
 type Message struct {
-	Role             string     `json:"role"`                        // "user", "assistant", "system", "tool"
-	Content          string     `json:"content"`                     // The message text
-	Name             string     `json:"name,omitempty"`              // FC: function name when role="tool"
-	ReasoningContent string     `json:"reasoning_content,omitempty"` // Native thinking output (e.g. DeepSeek-R1)
-	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`        // FC: tool calls returned by model
-	ToolCallID       string     `json:"tool_call_id,omitempty"`      // FC: when role="tool", the ID of the call this responds to
+	Role       string     `json:"role"`                   // "user", "assistant", "system", "tool"
+	Content    string     `json:"content"`                // The message text
+	Name       string     `json:"name,omitempty"`         // FC: function name when role="tool"
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // FC: tool calls returned by model
+	ToolCallID string     `json:"tool_call_id,omitempty"` // FC: when role="tool", the ID of the call this responds to
 }
 
 // ToolDefinition describes a tool for Function Calling.
@@ -56,9 +55,6 @@ type LLMProvider interface {
 	// for this provider. This reflects configuration (ToolCallMode), not just
 	// model capability — returns false when mode="yaml" even if model supports FC.
 	IsToolCallingEnabled() bool
-
-	// GetName returns the provider name/identifier.
-	GetName() string
 }
 
 // Role constants.

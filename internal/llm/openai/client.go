@@ -89,7 +89,7 @@ func (c *Client) CallLLM(ctx context.Context, messages []llm.Message) (llm.Messa
 	}
 	// Enable native thinking for supported models
 	if c.config.ResolveThinkingMode() == "native" {
-		req.ReasoningEffort = "medium"
+		req.ReasoningEffort = c.config.ReasoningEffort
 	}
 
 	// Execute with retries
@@ -121,9 +121,8 @@ func (c *Client) CallLLM(ctx context.Context, messages []llm.Message) (llm.Messa
 	}
 
 	return llm.Message{
-		Role:             llm.RoleAssistant,
-		Content:          resp.Choices[0].Message.Content,
-		ReasoningContent: resp.Choices[0].Message.ReasoningContent,
+		Role:    llm.RoleAssistant,
+		Content: resp.Choices[0].Message.Content,
 	}, nil
 }
 
@@ -162,7 +161,7 @@ func (c *Client) CallLLMStream(ctx context.Context, messages []llm.Message, onCh
 	}
 	// Enable native thinking for supported models
 	if c.config.ResolveThinkingMode() == "native" {
-		req.ReasoningEffort = "medium"
+		req.ReasoningEffort = c.config.ReasoningEffort
 	}
 
 	stream, err := c.client.CreateChatCompletionStream(ctx, req)
@@ -174,7 +173,6 @@ func (c *Client) CallLLMStream(ctx context.Context, messages []llm.Message, onCh
 	defer stream.Close()
 
 	var sb strings.Builder
-	var reasoningSB strings.Builder
 	for {
 		chunkResp, err := stream.Recv()
 		if errors.Is(err, io.EOF) {
@@ -190,10 +188,6 @@ func (c *Client) CallLLMStream(ctx context.Context, messages []llm.Message, onCh
 		}
 
 		if len(chunkResp.Choices) > 0 {
-			// Collect reasoning content (native thinking)
-			if rc := chunkResp.Choices[0].Delta.ReasoningContent; rc != "" {
-				reasoningSB.WriteString(rc)
-			}
 			// Collect normal content
 			if delta := chunkResp.Choices[0].Delta.Content; delta != "" {
 				sb.WriteString(delta)
@@ -203,9 +197,8 @@ func (c *Client) CallLLMStream(ctx context.Context, messages []llm.Message, onCh
 	}
 
 	return llm.Message{
-		Role:             llm.RoleAssistant,
-		Content:          sb.String(),
-		ReasoningContent: reasoningSB.String(),
+		Role:    llm.RoleAssistant,
+		Content: sb.String(),
 	}, nil
 }
 
@@ -305,9 +298,8 @@ func (c *Client) CallLLMWithTools(ctx context.Context, messages []llm.Message, t
 
 	// Build result message
 	result := llm.Message{
-		Role:             llm.RoleAssistant,
-		Content:          choice.Content,
-		ReasoningContent: choice.ReasoningContent,
+		Role:    llm.RoleAssistant,
+		Content: choice.Content,
 	}
 
 	// Extract tool calls if present
@@ -334,9 +326,4 @@ func (c *Client) CallLLMWithTools(ctx context.Context, messages []llm.Message, t
 func (c *Client) IsToolCallingEnabled() bool {
 	mode := c.config.ResolveToolCallMode()
 	return mode == "fc"
-}
-
-// GetName returns the provider name.
-func (c *Client) GetName() string {
-	return fmt.Sprintf("openai-compatible (%s)", c.config.Model)
 }

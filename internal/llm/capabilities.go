@@ -4,8 +4,7 @@ import "strings"
 
 // ThinkingCapability describes a model's native thinking support.
 type ThinkingCapability struct {
-	SupportsNativeThinking bool   // Whether the model supports native thinking
-	ReasoningEffortParam   string // API parameter name ("reasoning_effort" for OpenAI-compat)
+	SupportsNativeThinking bool // Whether the model supports native thinking
 }
 
 // DetectThinkingCapability determines if a model supports native thinking
@@ -51,10 +50,7 @@ func DetectThinkingCapability(modelName string) ThinkingCapability {
 
 	for _, known := range knownThinkingModels {
 		if strings.HasPrefix(baseName, known) {
-			return ThinkingCapability{
-				SupportsNativeThinking: true,
-				ReasoningEffortParam:   "reasoning_effort",
-			}
+			return ThinkingCapability{SupportsNativeThinking: true}
 		}
 	}
 
@@ -67,10 +63,7 @@ func DetectThinkingCapability(modelName string) ThinkingCapability {
 
 	for _, kw := range thinkingKeywords {
 		if strings.Contains(baseName, kw) {
-			return ThinkingCapability{
-				SupportsNativeThinking: true,
-				ReasoningEffortParam:   "reasoning_effort",
-			}
+			return ThinkingCapability{SupportsNativeThinking: true}
 		}
 	}
 

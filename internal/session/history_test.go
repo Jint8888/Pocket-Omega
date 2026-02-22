@@ -107,3 +107,66 @@ func TestToProblemPrefix_Empty(t *testing.T) {
 		t.Errorf("expected empty string for empty turns, got %q", prefix)
 	}
 }
+
+// ── Summary injection tests ──
+
+func TestToMessages_WithSummary(t *testing.T) {
+	turns := []Turn{{UserMsg: "q1", Assistant: "a1"}}
+	msgs := ToMessages(turns, 0, "摘要内容")
+
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages (1 summary + 1 turn × 2), got %d", len(msgs))
+	}
+	// First message should be summary with RoleSystem
+	if msgs[0].Role != llm.RoleSystem {
+		t.Errorf("expected summary role to be system, got %q", msgs[0].Role)
+	}
+	if !strings.Contains(msgs[0].Content, "摘要内容") {
+		t.Errorf("expected summary content, got %q", msgs[0].Content)
+	}
+	if !strings.Contains(msgs[0].Content, "[对话历史摘要]") {
+		t.Errorf("expected summary header, got %q", msgs[0].Content)
+	}
+	// Remaining should be the turn
+	if msgs[1].Role != llm.RoleUser || msgs[1].Content != "q1" {
+		t.Errorf("unexpected msg[1]: %+v", msgs[1])
+	}
+}
+
+func TestToMessages_WithSummaryNoTurns(t *testing.T) {
+	msgs := ToMessages(nil, 0, "orphan summary")
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message (summary only), got %d", len(msgs))
+	}
+	if msgs[0].Role != llm.RoleSystem {
+		t.Errorf("expected RoleSystem, got %q", msgs[0].Role)
+	}
+}
+
+func TestToProblemPrefix_WithSummary(t *testing.T) {
+	turns := []Turn{{UserMsg: "q", Assistant: "a"}}
+	prefix := ToProblemPrefix(turns, 0, "历史摘要")
+
+	// Summary should appear before turn history
+	summaryIdx := strings.Index(prefix, "[对话历史摘要]")
+	historyIdx := strings.Index(prefix, "[对话历史]")
+	if summaryIdx < 0 || historyIdx < 0 {
+		t.Fatalf("missing headers: summary=%d history=%d", summaryIdx, historyIdx)
+	}
+	if summaryIdx >= historyIdx {
+		t.Errorf("summary should appear before history, got summary=%d history=%d", summaryIdx, historyIdx)
+	}
+	if !strings.Contains(prefix, "历史摘要") {
+		t.Error("prefix missing summary content")
+	}
+}
+
+func TestToProblemPrefix_SummaryOnly(t *testing.T) {
+	prefix := ToProblemPrefix(nil, 0, "只有摘要")
+	if !strings.Contains(prefix, "只有摘要") {
+		t.Errorf("expected summary content in prefix, got %q", prefix)
+	}
+	if strings.Contains(prefix, "[对话历史]") {
+		t.Error("should not have turn history header with no turns")
+	}
+}

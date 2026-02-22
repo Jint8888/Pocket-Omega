@@ -27,18 +27,6 @@ type NodeRuntimeInfo struct {
 	TsxReady *atomic.Bool
 }
 
-// IsTsxReady returns true when tsx is usable: either it was already installed
-// at startup, or the background install has since completed successfully.
-func (n *NodeRuntimeInfo) IsTsxReady() bool {
-	if n.TsxAvailable {
-		return true
-	}
-	if n.TsxReady != nil {
-		return n.TsxReady.Load()
-	}
-	return false
-}
-
 // StatusString returns a human-readable status for injection into the
 // [运行时环境] block of mcp_server_guide.md.
 func (n *NodeRuntimeInfo) StatusString() string {

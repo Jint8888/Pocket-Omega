@@ -19,6 +19,7 @@ type Turn struct {
 type Session struct {
 	ID       string
 	History  []Turn
+	Summary  string // compact summary of older turns (accumulated across multiple /compact calls)
 	LastUsed time.Time
 }
 
@@ -30,7 +31,7 @@ type Store struct {
 	sessions map[string]*Session
 	ttl      time.Duration // inactivity TTL, e.g. 30 minutes
 	maxTurns int           // max turns retained per session, e.g. 10
-	done     chan struct{}  // closed by Close() to stop the cleanup goroutine
+	done     chan struct{} // closed by Close() to stop the cleanup goroutine
 }
 
 // NewStore creates a new Store with the given TTL and maxTurns limit.
@@ -70,18 +71,35 @@ func (s *Store) AppendTurn(id string, turn Turn) {
 	sess.LastUsed = time.Now()
 }
 
-// GetHistory returns a snapshot of the session's turn history.
-// Returns nil for unknown session IDs (treated as empty history).
-func (s *Store) GetHistory(id string) []Turn {
+// GetSessionContext atomically returns both turn history and compact summary.
+// Prefer this over separate GetHistory + GetSummary calls to avoid TOCTOU issues.
+func (s *Store) GetSessionContext(id string) ([]Turn, string) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	sess, ok := s.sessions[id]
 	if !ok {
-		return nil
+		return nil, ""
 	}
 	result := make([]Turn, len(sess.History))
 	copy(result, sess.History)
-	return result
+	return result, sess.Summary
+}
+
+// Compact replaces old turns with a summary, keeping the newest keepN turns.
+// The caller is responsible for merging any existing summary into the new one
+// before calling this method (see cmdCompact).
+func (s *Store) Compact(id string, summary string, keepN int) (compacted int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sess, ok := s.sessions[id]
+	if !ok || len(sess.History) <= keepN {
+		return 0
+	}
+	compacted = len(sess.History) - keepN
+	sess.Summary = summary
+	sess.History = sess.History[len(sess.History)-keepN:]
+	sess.LastUsed = time.Now()
+	return compacted
 }
 
 // Delete explicitly removes a session (e.g., user clicks "Clear Chat").
@@ -121,4 +139,3 @@ func (s *Store) cleanupLoop() {
 		}
 	}
 }
-

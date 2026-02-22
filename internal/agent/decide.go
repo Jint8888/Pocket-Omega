@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/pocketomega/pocket-omega/internal/core"
 	"github.com/pocketomega/pocket-omega/internal/llm"
@@ -53,7 +54,14 @@ func (n *DecideNode) Prep(state *AgentState) []DecidePrep {
 	// Phase 2: detect MCP intent for conditional guide loading
 	hasMCPIntent := containsMCPKeywords(state.Problem)
 
-	return []DecidePrep{{
+	// CostGuard: check duration limit (Prep runs every step, ideal for time checks)
+	if state.CostGuard != nil {
+		if err := state.CostGuard.CheckDuration(); err != nil {
+			log.Printf("[CostGuard] %v", err)
+		}
+	}
+
+	prep := DecidePrep{
 		Problem:             state.Problem,
 		WorkspaceDir:        state.WorkspaceDir,
 		StepSummary:         stepSummary,
@@ -68,7 +76,28 @@ func (n *DecideNode) Prep(state *AgentState) []DecidePrep {
 		HasMCPIntent:        hasMCPIntent,
 		ContextWindowTokens: state.ContextWindowTokens,
 		LoopDetected:        (&LoopDetector{}).Check(state.StepHistory),
-	}}
+		CostGuard:           state.CostGuard, // pointer shared for Exec to record tokens
+	}
+
+	// Estimate system prompt size for CostGuard + ContextGuard accuracy.
+	// buildSystemPrompt needs the full prep, so we compute after construction.
+	// Use the mode that will be used in Exec ("fc" for FC, thinkingMode for YAML).
+	mode := state.ThinkingMode
+	isFC := state.ToolCallMode == "fc" || (state.ToolCallMode == "auto" && n.llmProvider.IsToolCallingEnabled())
+	if isFC {
+		mode = "fc"
+	}
+	prep.SystemPromptEst = estimateTokens(n.buildSystemPrompt(mode, prep))
+
+	// FC mode: tool definitions are sent as structured JSON alongside messages,
+	// adding ~5-15% to actual token usage. Estimate from serialized form.
+	if isFC && len(prep.ToolDefinitions) > 0 {
+		if toolDefBytes, err := json.Marshal(prep.ToolDefinitions); err == nil {
+			prep.SystemPromptEst += estimateTokens(string(toolDefBytes))
+		}
+	}
+
+	return []DecidePrep{prep}
 }
 
 // Exec calls LLM to decide the next action.
@@ -77,33 +106,67 @@ func (n *DecideNode) Prep(state *AgentState) []DecidePrep {
 //   - "auto": detect capability, FC with auto-downgrade to YAML on failure
 //   - "yaml": forced YAML (original behavior)
 func (n *DecideNode) Exec(ctx context.Context, prep DecidePrep) (Decision, error) {
+	var decision Decision
+	var err error
+
 	switch prep.ToolCallMode {
 	case "fc":
-		// Forced FC mode — no fallback
 		log.Printf("[Decide] Using FC path (forced)")
-		return n.execWithFC(ctx, prep)
+		decision, err = n.execWithFC(ctx, prep)
 
 	case "auto":
-		// Auto mode — use FC if supported, with YAML fallback
 		if n.llmProvider.IsToolCallingEnabled() {
 			log.Printf("[Decide] Using FC path (auto-detected)")
-			decision, err := n.execWithFC(ctx, prep)
+			decision, err = n.execWithFC(ctx, prep)
 			if err != nil {
 				log.Printf("[Decide] FC path failed, auto-downgrade to YAML: %v", err)
-				return n.execWithYAML(ctx, prep)
+				decision, err = n.execWithYAML(ctx, prep)
 			}
-			return decision, nil
+		} else {
+			log.Printf("[Decide] Model does not support FC, using YAML path")
+			decision, err = n.execWithYAML(ctx, prep)
 		}
-		log.Printf("[Decide] Model does not support FC, using YAML path")
-		return n.execWithYAML(ctx, prep)
 
 	default: // explicit "yaml" or any unrecognised value
 		if prep.ToolCallMode != "yaml" {
 			log.Printf("[Decide] WARNING: unrecognised ToolCallMode %q, falling back to YAML", prep.ToolCallMode)
 		}
 		log.Printf("[Decide] Using YAML path")
-		return n.execWithYAML(ctx, prep)
+		decision, err = n.execWithYAML(ctx, prep)
 	}
+
+	if err != nil {
+		return decision, err
+	}
+
+	// CostGuard: estimate and record tokens (input + output)
+	if prep.CostGuard != nil {
+		// Input estimate includes system prompt (computed in Prep) + step context
+		inputEst := prep.SystemPromptEst +
+			estimateTokens(prep.StepSummary+prep.ToolsPrompt+prep.ConversationHistory)
+		outputEst := estimateTokens(decision.Answer + decision.Thinking + decision.Reason)
+		if recErr := prep.CostGuard.RecordTokens(inputEst + outputEst); recErr != nil {
+			log.Printf("[CostGuard] %v", recErr)
+		}
+	}
+
+	// ContextGuard: check context window usage including system prompt estimate
+	if prep.ContextWindowTokens > 0 {
+		guard := NewContextGuard(prep.ContextWindowTokens)
+		// Include SystemPromptEst to avoid underestimating by ~20-25%
+		contentTokens := prep.SystemPromptEst +
+			estimateTokens(prep.StepSummary+prep.ToolsPrompt+prep.ConversationHistory+
+				prep.Problem+prep.ToolingSummary)
+		switch guard.CheckTokens(contentTokens) {
+		case ContextWarning:
+			log.Printf("[ContextGuard] Context at ~70%%, consider /compact")
+		case ContextCritical:
+			log.Printf("[ContextGuard] Context at ~85%%, scheduling auto-compact")
+			decision.ContextStatus = ContextCritical
+		}
+	}
+
+	return decision, nil
 }
 
 // execWithFC uses Function Calling to get structured tool calls from the model.
@@ -251,12 +314,40 @@ func (n *DecideNode) Post(state *AgentState, prep []DecidePrep, results ...Decis
 		return core.ActionAnswer
 	}
 
+	// CostGuard: force answer if budget/duration exceeded (highest priority)
+	if state.CostGuard != nil && state.CostGuard.IsExceeded() {
+		log.Printf("[CostGuard] Budget/duration exceeded, forcing answer")
+		return core.ActionAnswer
+	}
+
+	// ContextGuard: transfer Decision.ContextStatus → state.pendingCompact,
+	// then execute auto-compact if needed (non-fatal on failure).
+	if decision.ContextStatus == ContextCritical {
+		state.pendingCompact = true
+	}
+	if state.pendingCompact && state.OnContextOverflow != nil {
+		state.pendingCompact = false
+		compactCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		if err := state.OnContextOverflow(compactCtx); err != nil {
+			log.Printf("[ContextGuard] Auto-compact failed: %v", err)
+		}
+	}
+
 	switch decision.Action {
 	case "tool":
-		// LoopDetector hard override: if loop detected and LLM still chose tool, force answer
+		// LoopDetector: soft intervention first, hard override on streak ≥ 2
 		if len(prep) > 0 && prep[0].LoopDetected.Detected {
-			log.Printf("[LoopDetector] Hard override: tool → answer (%s)", prep[0].LoopDetected.Rule)
-			return core.ActionAnswer
+			state.LoopDetectionStreak++
+			if state.LoopDetectionStreak >= 2 {
+				log.Printf("[LoopDetector] Hard override (streak=%d): tool → answer (%s)",
+					state.LoopDetectionStreak, prep[0].LoopDetected.Rule)
+				return core.ActionAnswer
+			}
+			// First detection: warning already injected in Prep, let LLM self-correct
+			log.Printf("[LoopDetector] Soft warning (streak=1), allowing tool call")
+		} else {
+			state.LoopDetectionStreak = 0 // reset on clean step
 		}
 		return core.ActionTool
 	case "think":
@@ -528,8 +619,7 @@ func buildDecidePrompt(prep DecidePrep) string {
 		sb.WriteString(`请以 YAML 格式回复你的决策：
 ` + "```yaml" + `
 action: "tool"  # 或 "answer"
-reason: "决策理由"
-headline: "正在执行..."  # 可选：用户可见的一句话操作摘要
+reason: "本步具体做什么（不要重复之前说过的话）"
 tool_name: "工具名"       # action=tool 时必需
 tool_params:              # action=tool 时必需
   param1: "value1"
@@ -540,8 +630,7 @@ answer: |                 # action=answer 时
 		sb.WriteString(`请以 YAML 格式回复你的决策：
 ` + "```yaml" + `
 action: "tool"  # 或 "think" 或 "answer"
-reason: "决策理由"
-headline: "正在执行..."  # 可选：用户可见的一句话操作摘要
+reason: "本步具体做什么（不要重复之前说过的话）"
 tool_name: "工具名"       # action=tool 时必需
 tool_params:              # action=tool 时必需
   param1: "value1"

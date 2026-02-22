@@ -8,9 +8,9 @@ sandbox 约束 — `file_read`/`file_write`/`file_list` 等文件工具被限制
 
 shell 环境 — 当前系统为 **{{OS}}**，`shell_exec` 使用 `{{SHELL_CMD}}` 执行命令。Windows 下注意：PowerShell 不支持 `&&`，用 `;` 或 `if/else` 替代；路径分隔符用 `\`；常用命令对照：`dir`（非 `ls`）、`type`（非 `cat`）、`copy`（非 `cp`）、`move`（非 `mv`）。
 
-mcp 系统 — `mcp.json` 定义外部 MCP server 配置。修改 `mcp.json` 后调用 `mcp_reload` 热更新（无需重启）。自建工具必须通过 MCP Server 实现，创建规范见后续 MCP 指引。
+mcp 系统 — `mcp.json` 定义外部 MCP server 配置。**添加/移除/修改 server 必须用 `mcp_server_add`/`mcp_server_remove` 工具，禁止用 `file_write`/`file_patch` 或任何文件编辑工具直接修改 mcp.json**（直接编辑会破坏 JSON 格式化）。修改后调用 `mcp_reload` 热更新（无需重启）。自建工具必须通过 MCP Server 实现，创建规范见后续 MCP 指引。
 
-热更新 — `mcp_reload` 工具同时刷新 MCP 连接和提示词缓存。rules.md 修改后必须调用 `mcp_reload` 才能生效。
+热更新 — `mcp_reload` 工具同时刷新 MCP 连接和提示词缓存。rules.md 修改后必须调用 `mcp_reload` 才能生效。stdio 类型的 MCP server 不能用 `shell_exec` 直接运行测试——它们会阻塞在 stdin 等待 JSON-RPC 输入。要验证 server 是否正常，用 `mcp_reload` 后观察 connected 数量和工具列表变化。
 
 workspace 迁移 — 新路径的文件操作必须通过 `shell_exec`（sandbox 限制），不能用 file 类工具。核心文件：`mcp.json`、`rules.md`、`soul.md`、`skills/`、`prompts/`。迁移后用 `config_edit` 更新 `.env` 中的 `WORKSPACE_DIR`，提醒用户重启。不主动删除旧 workspace 文件。
 

@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"crypto/md5"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -27,6 +29,23 @@ var paramDedupTools = map[string]string{
 	"file_delete": "path",
 	"file_grep":   "path",
 	"shell_exec":  "command",
+	// update_plan is a plan management tool legitimately called multiple times
+	// per task (set + one update per step). Dedup by step_id so only repeated
+	// calls on the same step trigger the loop detector.
+	"update_plan": "step_id",
+}
+
+// toolCallKey returns the deduplication key for Rule 1.
+// Whitelist tools (paramDedupTools): use the specified semantic param as key.
+// All other tools: use full-params MD5 hash (new tools benefit automatically,
+// no whitelist maintenance needed).
+func toolCallKey(s StepRecord) struct{ name, key string } {
+	if paramKey, ok := paramDedupTools[s.ToolName]; ok {
+		return struct{ name, key string }{s.ToolName, extractParam(s.Input, paramKey)}
+	}
+	// #nosec G401 -- MD5 used only for deduplication, not security
+	h := md5.Sum([]byte(s.Input))
+	return struct{ name, key string }{s.ToolName, fmt.Sprintf("%x", h)}
 }
 
 // LoopDetector analyzes StepHistory to detect repetitive agent behavior.
@@ -71,26 +90,25 @@ func (d *LoopDetector) Check(steps []StepRecord) DetectionResult {
 func (d *LoopDetector) checkSameToolFrequency(toolSteps []StepRecord) DetectionResult {
 	window := recentWindow(toolSteps, loopWindowSize)
 
-	// Count per-tool frequency, respecting paramDedupTools exemptions.
-	type toolKey struct {
-		name  string
-		param string // empty for non-dedup tools
+	// Count per-tool frequency using dual-mode dedup key.
+	// Whitelist tools: semantic param key (e.g., path, step_id).
+	// Other tools: full-params MD5 hash.
+	type dedupKey struct {
+		name string
+		key  string
 	}
-	freq := make(map[toolKey]int)
+	freq := make(map[dedupKey]int)
 
 	for _, s := range window {
-		key := toolKey{name: s.ToolName}
-		if paramKey, ok := paramDedupTools[s.ToolName]; ok {
-			key.param = extractParam(s.Input, paramKey)
-		}
-		freq[key]++
+		k := toolCallKey(s)
+		freq[dedupKey{k.name, k.key}]++
 	}
 
 	for k, count := range freq {
 		if count >= loopSameToolLimit {
 			desc := k.name + " 被调用了 " + strconv.Itoa(count) + " 次"
-			if k.param != "" {
-				desc += "（参数: " + truncate(k.param, 60) + "）"
+			if k.key != "" && len(k.key) <= 60 {
+				desc += "（参数: " + k.key + "）"
 			}
 			return DetectionResult{
 				Detected:    true,

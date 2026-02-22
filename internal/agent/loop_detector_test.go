@@ -7,20 +7,63 @@ import (
 // ── Rule 1: Same Tool Frequency ──
 
 func TestCheck_SameToolFrequency_Triggered(t *testing.T) {
+	// Non-whitelist tool with IDENTICAL full params → hash matches → triggers
 	steps := []StepRecord{
 		{Type: "tool", ToolName: "web_search", Input: `{"query":"rust"}`, StepNumber: 1},
 		{Type: "decide", StepNumber: 2},
-		{Type: "tool", ToolName: "web_search", Input: `{"query":"rust lang"}`, StepNumber: 3},
+		{Type: "tool", ToolName: "web_search", Input: `{"query":"rust"}`, StepNumber: 3},
 		{Type: "decide", StepNumber: 4},
-		{Type: "tool", ToolName: "web_search", Input: `{"query":"rust features"}`, StepNumber: 5},
+		{Type: "tool", ToolName: "web_search", Input: `{"query":"rust"}`, StepNumber: 5},
 	}
 	d := LoopDetector{}
 	r := d.Check(steps)
 	if !r.Detected {
-		t.Fatal("expected detection")
+		t.Fatal("expected detection for identical full params")
 	}
 	if r.Rule != "same_tool_freq" {
 		t.Fatalf("expected rule same_tool_freq, got %s", r.Rule)
+	}
+}
+
+func TestCheck_SameToolFrequency_HashDedup_DiffParams(t *testing.T) {
+	// Non-whitelist tool with DIFFERENT full params → hash differs → no trigger
+	steps := []StepRecord{
+		{Type: "tool", ToolName: "web_search", Input: `{"query":"rust"}`, StepNumber: 1},
+		{Type: "tool", ToolName: "web_search", Input: `{"query":"rust lang"}`, StepNumber: 2},
+		{Type: "tool", ToolName: "web_search", Input: `{"query":"rust features"}`, StepNumber: 3},
+	}
+	d := LoopDetector{}
+	r := d.Check(steps)
+	if r.Detected {
+		t.Fatalf("should NOT trigger for different params, got rule=%s desc=%s", r.Rule, r.Description)
+	}
+}
+
+func TestCheck_SameToolFrequency_UpdatePlanSameStepID(t *testing.T) {
+	// Whitelist tool (update_plan): same step_id but different status → triggers (semantic dedup)
+	steps := []StepRecord{
+		{Type: "tool", ToolName: "update_plan", Input: `{"step_id":"1","status":"in_progress"}`, StepNumber: 1},
+		{Type: "tool", ToolName: "update_plan", Input: `{"step_id":"1","status":"done"}`, StepNumber: 2},
+		{Type: "tool", ToolName: "update_plan", Input: `{"step_id":"1","status":"in_progress"}`, StepNumber: 3},
+	}
+	d := LoopDetector{}
+	r := d.Check(steps)
+	if !r.Detected || r.Rule != "same_tool_freq" {
+		t.Fatalf("expected same_tool_freq for update_plan with same step_id, got detected=%v rule=%s", r.Detected, r.Rule)
+	}
+}
+
+func TestCheck_SameToolFrequency_MCPServerAdd_DiffNames(t *testing.T) {
+	// Non-whitelist tool (mcp_server_add) with different full params → no trigger
+	steps := []StepRecord{
+		{Type: "tool", ToolName: "mcp_server_add", Input: `{"name":"server1","url":"http://a"}`, StepNumber: 1},
+		{Type: "tool", ToolName: "mcp_server_add", Input: `{"name":"server2","url":"http://b"}`, StepNumber: 2},
+		{Type: "tool", ToolName: "mcp_server_add", Input: `{"name":"server3","url":"http://c"}`, StepNumber: 3},
+	}
+	d := LoopDetector{}
+	r := d.Check(steps)
+	if r.Detected {
+		t.Fatalf("should NOT trigger for mcp_server_add with different params, got rule=%s desc=%s", r.Rule, r.Description)
 	}
 }
 
@@ -276,6 +319,39 @@ func TestJaccardSimilarity_BothEmpty(t *testing.T) {
 	j2 := jaccardSimilarity(bigrams(""), bigrams(""))
 	if j2 != 1.0 {
 		t.Fatalf("expected 1.0 for bigrams of empty strings, got %f", j2)
+	}
+}
+
+// ── update_plan dedup tests ──
+
+func TestCheck_UpdatePlan_DifferentStepIDs(t *testing.T) {
+	// set + update stepA + update stepB — legitimate plan management, must NOT trigger
+	steps := []StepRecord{
+		{Type: "tool", ToolName: "update_plan", Input: `{"operation":"set","steps":[{"id":"stepA","title":"A"},{"id":"stepB","title":"B"}]}`, StepNumber: 1},
+		{Type: "tool", ToolName: "update_plan", Input: `{"operation":"update","step_id":"stepA","status":"in_progress"}`, StepNumber: 2},
+		{Type: "tool", ToolName: "update_plan", Input: `{"operation":"update","step_id":"stepB","status":"in_progress"}`, StepNumber: 3},
+	}
+	d := LoopDetector{}
+	r := d.Check(steps)
+	if r.Detected {
+		t.Fatalf("expected no detection: set + update different step_ids is legitimate, got rule=%s desc=%s", r.Rule, r.Description)
+	}
+}
+
+func TestCheck_UpdatePlan_SameStepIDRepeated(t *testing.T) {
+	// update same step_id 3 times — real loop, must trigger
+	steps := []StepRecord{
+		{Type: "tool", ToolName: "update_plan", Input: `{"operation":"update","step_id":"stepA","status":"in_progress"}`, StepNumber: 1},
+		{Type: "tool", ToolName: "update_plan", Input: `{"operation":"update","step_id":"stepA","status":"in_progress"}`, StepNumber: 2},
+		{Type: "tool", ToolName: "update_plan", Input: `{"operation":"update","step_id":"stepA","status":"in_progress"}`, StepNumber: 3},
+	}
+	d := LoopDetector{}
+	r := d.Check(steps)
+	if !r.Detected {
+		t.Fatal("expected detection: same step_id updated 3 times")
+	}
+	if r.Rule != "same_tool_freq" {
+		t.Fatalf("expected same_tool_freq, got %s", r.Rule)
 	}
 }
 

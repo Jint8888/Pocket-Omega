@@ -13,6 +13,7 @@ import (
 // to the execution log file. This is a readability limit for the markdown file,
 // unrelated to the LLM context window budget.
 const execLogOutputMaxRunes = 4000
+const execLogReasonMaxRunes = 500
 
 // ExecLogger writes agent execution steps to a markdown file for debugging.
 // Thread-safe. The log file is truncated on creation.
@@ -58,7 +59,12 @@ func (l *ExecLogger) LogStep(step StepRecord) {
 	case "decide":
 		l.writef("**动作**: `%s`  \n", step.Action)
 		if step.Input != "" {
-			l.writef("**理由**: %s\n\n", step.Input)
+			reason := step.Input
+			runes := []rune(reason)
+			if len(runes) > execLogReasonMaxRunes {
+				reason = string(runes[:execLogReasonMaxRunes]) + "..."
+			}
+			l.writef("**理由**: %s\n\n", reason)
 		}
 
 	case "tool":
@@ -71,7 +77,7 @@ func (l *ExecLogger) LogStep(step StepRecord) {
 			// Truncate very long outputs for log readability
 			runes := []rune(output)
 			if len(runes) > execLogOutputMaxRunes {
-				output = string(runes[:execLogOutputMaxRunes]) + "\n... (truncated)"
+				output = string(runes[:execLogOutputMaxRunes]) + fmt.Sprintf("\n... (truncated, showing %d/%d chars)", execLogOutputMaxRunes, len(runes))
 			}
 			l.writef("\n<details>\n<summary>执行结果</summary>\n\n```\n%s\n```\n\n</details>\n\n", output)
 		}

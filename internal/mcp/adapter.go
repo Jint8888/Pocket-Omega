@@ -4,9 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/pocketomega/pocket-omega/internal/tool"
 )
+
+// mcpToolTimeout caps a single MCP tool call so that a hung MCP server
+// (e.g. a Python process with a blocking HTTP call) fails quickly and
+// returns control to the agent, which still has the remainder of the
+// overall agentTimeout to generate a meaningful answer.
+const mcpToolTimeout = 60 * time.Second
 
 // MCPToolAdapter bridges an MCP server tool to the tool.Tool interface,
 // making it indistinguishable from native built-in tools to the agent.
@@ -88,8 +95,13 @@ func (a *MCPToolAdapter) Execute(ctx context.Context, args json.RawMessage) (too
 }
 
 // executePersistent delegates to the long-lived shared client.
+// A per-call timeout (mcpToolTimeout) is applied so that a hung MCP server
+// does not consume the entire agent budget; the error is returned promptly
+// and the agent can still generate a final answer.
 func (a *MCPToolAdapter) executePersistent(ctx context.Context, params map[string]any) (tool.ToolResult, error) {
-	text, err := a.client.CallTool(ctx, a.info.Name, params)
+	callCtx, cancel := context.WithTimeout(ctx, mcpToolTimeout)
+	defer cancel()
+	text, err := a.client.CallTool(callCtx, a.info.Name, params)
 	if err != nil {
 		return tool.ToolResult{Error: err.Error()}, nil
 	}
@@ -98,16 +110,19 @@ func (a *MCPToolAdapter) executePersistent(ctx context.Context, params map[strin
 
 // executePerCall creates an ephemeral Client, connects, calls the tool, then
 // closes the connection. The child process is terminated by Close().
+// mcpToolTimeout bounds the full connect+call sequence.
 func (a *MCPToolAdapter) executePerCall(ctx context.Context, params map[string]any) (tool.ToolResult, error) {
+	callCtx, cancel := context.WithTimeout(ctx, mcpToolTimeout)
+	defer cancel()
 	c := NewClient(a.cfg)
-	if err := c.Connect(ctx); err != nil {
+	if err := c.Connect(callCtx); err != nil {
 		return tool.ToolResult{
 			Error: fmt.Sprintf("mcp per_call: connect to %q: %v", a.cfg.Name, err),
 		}, nil
 	}
 	defer c.Close() //nolint:errcheck // best-effort cleanup
 
-	text, err := c.CallTool(ctx, a.info.Name, params)
+	text, err := c.CallTool(callCtx, a.info.Name, params)
 	if err != nil {
 		return tool.ToolResult{Error: err.Error()}, nil
 	}
