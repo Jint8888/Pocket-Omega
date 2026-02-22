@@ -78,7 +78,7 @@ func TestDangerousPatternBlocking(t *testing.T) {
 		t.Run(tt.command, func(t *testing.T) {
 			cmdLower := strings.ToLower(tt.command)
 			blocked := false
-			for _, pattern := range dangerousPatterns {
+			for _, pattern := range dangerousShellCommands {
 				if strings.Contains(cmdLower, pattern) {
 					blocked = true
 					break

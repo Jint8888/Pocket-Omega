@@ -205,7 +205,7 @@ func extractParam(jsonInput string, key string) string {
 
 // isSearchTool returns true for tools where query similarity matters.
 func isSearchTool(name string) bool {
-	return name == "web_search" || name == "search_tavily" ||
+	return name == "web_search" || name == "search_tavily" || name == "search_brave" ||
 		(strings.HasPrefix(name, "mcp_") && strings.Contains(name, "search"))
 }
 

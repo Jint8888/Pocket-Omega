@@ -18,12 +18,12 @@ const (
 	maxOutputChars = 8000
 )
 
-// dangerousPatterns are command patterns that are blocked for safety.
+// dangerousShellCommands are command patterns that are blocked for safety.
 // These are checked case-insensitively against the command string.
 // NOTE: This is a best-effort blocklist, not a security boundary.
 // Determined attackers can bypass it (e.g. base64-encoded payloads, find -delete).
 // The primary purpose is preventing accidental damage from LLM-generated commands.
-var dangerousPatterns = []string{
+var dangerousShellCommands = []string{
 	// Linux destructive deletion (various flag combos)
 	// "rm -rf /*" is intentionally omitted: "rm -rf /" is already a substring of it.
 	"rm -rf /",
@@ -109,7 +109,7 @@ func (t *ShellTool) Execute(ctx context.Context, args json.RawMessage) (tool.Too
 
 	// Check command against blacklist
 	cmdLower := strings.ToLower(a.Command)
-	for _, pattern := range dangerousPatterns {
+	for _, pattern := range dangerousShellCommands {
 		if strings.Contains(cmdLower, pattern) {
 			return tool.ToolResult{Error: fmt.Sprintf("安全限制: 命令包含危险模式 %q", pattern)}, nil
 		}

@@ -7,6 +7,7 @@
     <title>Pocket-Omega · Thinking Chat</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
     <style>
         * {
             margin: 0;
@@ -278,7 +279,137 @@
             font-size: 14px;
             line-height: 1.7;
             word-break: break-word;
+        }
+
+        .bubble-user {
             white-space: pre-wrap;
+        }
+
+        /* ── Markdown rendering in AI bubbles ── */
+        .bubble-ai h1,
+        .bubble-ai h2,
+        .bubble-ai h3 {
+            color: #e2e8f0;
+            margin: 12px 0 6px;
+            line-height: 1.3;
+        }
+
+        .bubble-ai h1 {
+            font-size: 18px;
+        }
+
+        .bubble-ai h2 {
+            font-size: 16px;
+        }
+
+        .bubble-ai h3 {
+            font-size: 15px;
+        }
+
+        .bubble-ai h1:first-child,
+        .bubble-ai h2:first-child,
+        .bubble-ai h3:first-child {
+            margin-top: 0;
+        }
+
+        .bubble-ai p {
+            margin: 6px 0;
+        }
+
+        .bubble-ai p:first-child {
+            margin-top: 0;
+        }
+
+        .bubble-ai p:last-child {
+            margin-bottom: 0;
+        }
+
+        .bubble-ai ul,
+        .bubble-ai ol {
+            padding-left: 20px;
+            margin: 6px 0;
+        }
+
+        .bubble-ai li {
+            margin: 3px 0;
+        }
+
+        .bubble-ai a {
+            color: #818cf8;
+            text-decoration: none;
+            border-bottom: 1px solid rgba(129, 140, 248, 0.3);
+            transition: color 0.2s, border-color 0.2s;
+        }
+
+        .bubble-ai a:hover {
+            color: #a5b4fc;
+            border-bottom-color: #a5b4fc;
+        }
+
+        .bubble-ai code {
+            background: rgba(30, 41, 59, 0.8);
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 13px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            color: #e879f9;
+        }
+
+        .bubble-ai pre {
+            background: rgba(15, 23, 42, 0.8);
+            border: 1px solid rgba(148, 163, 184, 0.1);
+            border-radius: 8px;
+            padding: 12px;
+            overflow-x: auto;
+            margin: 8px 0;
+        }
+
+        .bubble-ai pre code {
+            background: none;
+            padding: 0;
+            color: #e2e8f0;
+            font-size: 13px;
+        }
+
+        .bubble-ai blockquote {
+            border-left: 3px solid #6366f1;
+            padding-left: 12px;
+            margin: 8px 0;
+            color: #94a3b8;
+        }
+
+        .bubble-ai table {
+            border-collapse: collapse;
+            margin: 8px 0;
+            width: 100%;
+        }
+
+        .bubble-ai th,
+        .bubble-ai td {
+            border: 1px solid rgba(148, 163, 184, 0.15);
+            padding: 6px 10px;
+            text-align: left;
+            font-size: 13px;
+        }
+
+        .bubble-ai th {
+            background: rgba(30, 41, 59, 0.6);
+            font-weight: 600;
+            color: #cbd5e1;
+        }
+
+        .bubble-ai hr {
+            border: none;
+            border-top: 1px solid rgba(148, 163, 184, 0.12);
+            margin: 12px 0;
+        }
+
+        .bubble-ai strong {
+            color: #f1f5f9;
+        }
+
+        .bubble-ai em {
+            color: #cbd5e1;
         }
 
         .bubble-user {
@@ -287,6 +418,7 @@
             color: #fff;
             border-bottom-right-radius: 4px;
             box-shadow: 0 2px 8px rgba(79, 70, 229, 0.25);
+            white-space: pre-wrap;
         }
 
         .bubble-ai {
@@ -421,6 +553,73 @@
 
             40% {
                 transform: scale(1);
+            }
+        }
+
+        /* ── Plan Progress ── */
+        .plan-progress {
+            background: rgba(30, 30, 30, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 12px 16px;
+            margin: 8px 0;
+            max-width: 90%;
+        }
+
+        .plan-header {
+            font-weight: 600;
+            font-size: 13px;
+            margin-bottom: 8px;
+            color: #e2e8f0;
+        }
+
+        .plan-step {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 4px 0;
+            font-size: 13px;
+            color: #cbd5e1;
+        }
+
+        .plan-icon {
+            width: 20px;
+            text-align: center;
+        }
+
+        .plan-done .plan-title {
+            color: #64748b;
+            text-decoration: line-through;
+        }
+
+        .plan-error .plan-title {
+            color: #f87171;
+        }
+
+        .plan-skipped .plan-title {
+            color: #64748b;
+            font-style: italic;
+        }
+
+        .plan-detail {
+            font-size: 11px;
+            color: #64748b;
+            margin-left: 4px;
+        }
+
+        .plan-in_progress .plan-icon {
+            animation: pulse 1.2s infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.4;
             }
         }
 
@@ -710,6 +909,21 @@
             return d.innerHTML;
         }
 
+        function renderMarkdown(text) {
+            if (!text) return '';
+            try {
+                const renderer = new marked.Renderer();
+                renderer.link = function ({ href, title, text }) {
+                    const t = title ? ' title="' + escapeHtml(title) + '"' : '';
+                    return '<a href="' + escapeHtml(href) + '"' + t + ' target="_blank" rel="noopener noreferrer">' + text + '</a>';
+                };
+                return marked.parse(text, { renderer: renderer, breaks: true });
+            } catch (e) {
+                console.error('Markdown render error:', e);
+                return escapeHtml(text);
+            }
+        }
+
         function addUserMsg(text) {
             // Remove welcome message if present
             const welcome = chatBox.querySelector('.welcome-msg');
@@ -731,7 +945,7 @@
                 '<div class="ai-avatar">Ω</div>' +
                 '<div class="' + bubbleClass + '">' +
                 '<div class="label">' + labelText + '</div>' +
-                escapeHtml(content) +
+                renderMarkdown(content) +
                 '</div></div>';
             chatBox.appendChild(div);
             scrollBottom();
@@ -844,6 +1058,37 @@
                 box.removeAttribute('open');
                 box.removeAttribute('id');
             }
+            // Clean up plan progress display when agent completes
+            const planEl = document.getElementById('plan-progress');
+            if (planEl) planEl.removeAttribute('id');
+        }
+
+        function renderPlanProgress(steps) {
+            let container = document.getElementById('plan-progress');
+            if (!container) {
+                container = document.createElement('div');
+                container.id = 'plan-progress';
+                container.className = 'plan-progress';
+                // Insert before stream-bubble if exists, otherwise append to chat area
+                const agentBubble = document.getElementById('stream-bubble');
+                if (agentBubble) {
+                    agentBubble.parentNode.insertBefore(container, agentBubble);
+                } else {
+                    chatBox.appendChild(container);
+                }
+            }
+            const icons = {
+                pending: '⏳', in_progress: '🔄', done: '✅', error: '❌', skipped: '⏭'
+            };
+            container.innerHTML = '<div class="plan-header">📋 执行计划</div>' +
+                steps.map(function (s) {
+                    return '<div class="plan-step plan-' + escapeHtml(s.status) + '">' +
+                        '<span class="plan-icon">' + (icons[s.status] || '⏳') + '</span>' +
+                        '<span class="plan-title">' + escapeHtml(s.title) + '</span>' +
+                        (s.detail ? '<span class="plan-detail">' + escapeHtml(s.detail) + '</span>' : '') +
+                        '</div>';
+                }).join('');
+            scrollBottom();
         }
 
         // ── Streaming bubble helpers ──
@@ -867,7 +1112,9 @@
 
         function appendStreamChunk(text) {
             const el = getOrCreateStreamBubble();
-            el.textContent += text;
+            if (!el._rawText) el._rawText = '';
+            el._rawText += text;
+            el.innerHTML = renderMarkdown(el._rawText);
             scrollBottom();
         }
 
@@ -877,7 +1124,7 @@
                 // Replace streaming content with final solution
                 const bubble = msg.querySelector('.bubble-ai');
                 if (bubble) {
-                    bubble.innerHTML = '<div class="label">Pocket-Omega</div>' + escapeHtml(solution);
+                    bubble.innerHTML = '<div class="label">Pocket-Omega</div>' + renderMarkdown(solution);
                 }
                 msg.removeAttribute('id');
                 const streamEl = document.getElementById('stream-bubble');
@@ -958,6 +1205,8 @@
                         } else if (event === 'chunk') {
                             removeLoading();
                             appendStreamChunk(parsed.text || '');
+                        } else if (event === 'plan') {
+                            renderPlanProgress(parsed.steps || []);
                         } else if (event === 'done') {
                             removeLoading();
                             finalizeThinkingBox();

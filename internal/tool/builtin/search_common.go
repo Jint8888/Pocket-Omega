@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/pocketomega/pocket-omega/internal/util"
 )
 
 const (
@@ -41,20 +43,6 @@ func parseSearchQuery(args json.RawMessage) (string, error) {
 	return q, nil
 }
 
-// truncateRunes truncates s to at most maxRunes Unicode code points,
-// appending "..." if truncation occurred.
-// If maxRunes <= 0, s is returned unchanged.
-func truncateRunes(s string, maxRunes int) string {
-	if maxRunes <= 0 {
-		return s
-	}
-	runes := []rune(s)
-	if len(runes) <= maxRunes {
-		return s
-	}
-	return string(runes[:maxRunes]) + "..."
-}
-
 // formatSearchResults formats a slice of searchResult into a human-readable string.
 func formatSearchResults(results []searchResult) string {
 	if len(results) == 0 {
@@ -63,7 +51,7 @@ func formatSearchResults(results []searchResult) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("找到 %d 条结果：\n\n", len(results)))
 	for i, r := range results {
-		desc := truncateRunes(r.Description, searchDescMaxRunes)
+		desc := util.TruncateRunes(r.Description, searchDescMaxRunes)
 		sb.WriteString(fmt.Sprintf("[%d] %s\n    %s\n    %s\n\n", i+1, r.Title, r.URL, desc))
 	}
 	return sb.String()

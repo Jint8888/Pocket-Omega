@@ -161,8 +161,10 @@ eval(compile(base64.b64decode(encoded), "<string>", "exec"))
 	if !hasObfuscated {
 		t.Errorf("expected obfuscated-code warn finding, got: %+v", findings)
 	}
-	// Note: eval() also triggers dynamic-code (critical), which is expected
-	_ = hasCrit
+	// eval() also triggers dynamic-code (critical) — verify this too.
+	if !hasCrit {
+		t.Errorf("expected dynamic-code (critical) finding from eval(), got: %+v", findings)
+	}
 }
 
 func TestScanScript_MissingFile(t *testing.T) {

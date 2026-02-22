@@ -12,10 +12,12 @@ import (
 	"github.com/pocketomega/pocket-omega/internal/agent"
 	"github.com/pocketomega/pocket-omega/internal/core"
 	"github.com/pocketomega/pocket-omega/internal/llm"
+	"github.com/pocketomega/pocket-omega/internal/plan"
 	"github.com/pocketomega/pocket-omega/internal/prompt"
 	"github.com/pocketomega/pocket-omega/internal/session"
 	"github.com/pocketomega/pocket-omega/internal/thinking"
 	"github.com/pocketomega/pocket-omega/internal/tool"
+	"github.com/pocketomega/pocket-omega/internal/tool/builtin"
 )
 
 const (
@@ -170,6 +172,12 @@ type sseErrorEvent struct {
 	Error string `json:"error"`
 }
 
+const sseEventPlan = "plan"
+
+type ssePlanEvent struct {
+	Steps []plan.PlanStep `json:"steps"`
+}
+
 // ── Chat Handler ──
 
 // ChatHandler handles chat requests and runs the CoT flow.
@@ -297,6 +305,7 @@ type AgentHandlerOptions struct {
 	OSName              string               // e.g. "Windows" — for runtime info line
 	ShellCmd            string               // e.g. "cmd.exe /c" — for runtime info line
 	ModelName           string               // e.g. "gemini-2.5-pro" — for runtime info line
+	PlanStore           *plan.PlanStore      // optional — enables update_plan tool
 }
 
 // AgentHandler handles agent requests with tool usage capability.
@@ -314,6 +323,7 @@ type AgentHandler struct {
 	osName              string
 	shellCmd            string
 	modelName           string
+	planStore           *plan.PlanStore
 }
 
 // NewAgentHandler creates a new agent handler from AgentHandlerOptions.
@@ -332,6 +342,7 @@ func NewAgentHandler(opts AgentHandlerOptions) *AgentHandler {
 		osName:              opts.OSName,
 		shellCmd:            opts.ShellCmd,
 		modelName:           opts.ModelName,
+		planStore:           opts.PlanStore,
 	}
 }
 
@@ -383,12 +394,25 @@ func (h *AgentHandler) HandleAgent(w http.ResponseWriter, r *http.Request) {
 		h.execLogger.StartSession(userMsg)
 	}
 
+	// Per-request: create update_plan tool with session context + SSE callback.
+	// Uses WithExtra to create a request-scoped registry copy — no mutation of global registry.
+	reqRegistry := h.toolRegistry
+	if h.planStore != nil {
+		planTool := builtin.NewUpdatePlanTool(h.planStore, sessionID, func(steps []plan.PlanStep) {
+			sse.Send(sseEventPlan, ssePlanEvent{Steps: steps})
+		})
+		reqRegistry = h.toolRegistry.WithExtra(planTool)
+		// Clean up plan data after agent completes (synchronous — safe with current design).
+		// If agent is ever moved to goroutine, move Delete to agent completion callback.
+		defer h.planStore.Delete(sessionID)
+	}
+
 	// Build agent state with SSE callback
 	state := &agent.AgentState{
 		Problem:             userMsg,
 		ConversationHistory: historyPrefix,
 		WorkspaceDir:        h.workspaceDir,
-		ToolRegistry:        h.toolRegistry,
+		ToolRegistry:        reqRegistry,
 		ThinkingMode:        h.thinkingMode,
 		ToolCallMode:        h.toolCallMode,
 		ContextWindowTokens: h.contextWindowTokens,

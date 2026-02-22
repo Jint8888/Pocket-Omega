@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/pocketomega/pocket-omega/internal/llm"
+	"github.com/pocketomega/pocket-omega/internal/util"
 )
 
 // ToMessages converts session turns into an LLM message list.
@@ -59,17 +60,9 @@ func ToProblemPrefix(turns []Turn, budget int) string {
 	sb.WriteString("[对话历史]\n")
 	round := 1
 	for i := 0; i+1 < len(msgs); i += 2 {
-		sb.WriteString(fmt.Sprintf("Round %d - 用户：%s\n", round, truncateRunes(msgs[i].Content, 500)))
-		sb.WriteString(fmt.Sprintf("Round %d - 助手：%s\n\n", round, truncateRunes(msgs[i+1].Content, 500)))
+		sb.WriteString(fmt.Sprintf("Round %d - 用户：%s\n", round, util.TruncateRunes(msgs[i].Content, 500)))
+		sb.WriteString(fmt.Sprintf("Round %d - 助手：%s\n\n", round, util.TruncateRunes(msgs[i+1].Content, 500)))
 		round++
 	}
 	return sb.String()
-}
-
-func truncateRunes(s string, max int) string {
-	r := []rune(s)
-	if len(r) <= max {
-		return s
-	}
-	return string(r[:max]) + "..."
 }

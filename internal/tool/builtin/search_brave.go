@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pocketomega/pocket-omega/internal/tool"
+	"github.com/pocketomega/pocket-omega/internal/util"
 )
 
 const (
@@ -120,7 +121,7 @@ func (t *BraveSearchTool) Execute(ctx context.Context, args json.RawMessage) (to
 		// LimitReader prevents OOM from unexpectedly large error bodies;
 		// further truncated before returning to avoid exposing internal details.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, braveErrMaxBody))
-		bodyStr := truncateRunes(strings.TrimSpace(string(body)), braveErrBodyShow)
+		bodyStr := util.TruncateRunes(strings.TrimSpace(string(body)), braveErrBodyShow)
 		return tool.ToolResult{Error: fmt.Sprintf("Brave API 错误 (HTTP %d): %s",
 			resp.StatusCode, bodyStr)}, nil
 	}

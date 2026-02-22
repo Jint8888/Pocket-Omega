@@ -13,3 +13,5 @@ mcp 系统 — `mcp.json` 定义外部 MCP server 配置。修改 `mcp.json` 后
 热更新 — `mcp_reload` 工具同时刷新 MCP 连接和提示词缓存。rules.md 修改后必须调用 `mcp_reload` 才能生效。
 
 workspace 迁移 — 新路径的文件操作必须通过 `shell_exec`（sandbox 限制），不能用 file 类工具。核心文件：`mcp.json`、`rules.md`、`soul.md`、`skills/`、`prompts/`。迁移后用 `config_edit` 更新 `.env` 中的 `WORKSPACE_DIR`，提醒用户重启。不主动删除旧 workspace 文件。
+
+git_info — 只读 Git 查询工具。支持 status/diff/log/branch/stash/show。查看变更：`git_info(command="status")` 或 `git_info(command="diff", path="file.go")`。查看历史：`git_info(command="log")` 默认最新 20 条。查看提交：`git_info(command="show", args="<hash>")`；查看指定文件：`args="<hash>:path/to/file"`（path 参数对 show/branch 无效）。无需用 `shell_exec` 运行 git 命令——`git_info` 更安全且 shell 禁用时仍可用。

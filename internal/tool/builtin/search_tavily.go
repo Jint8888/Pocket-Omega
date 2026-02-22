@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pocketomega/pocket-omega/internal/tool"
+	"github.com/pocketomega/pocket-omega/internal/util"
 )
 
 const (
@@ -131,7 +132,7 @@ func (t *TavilySearchTool) Execute(ctx context.Context, args json.RawMessage) (t
 		// LimitReader prevents OOM from unexpectedly large error bodies;
 		// further truncated before returning to avoid exposing internal details.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, tavilyErrMaxBody))
-		bodyStr := truncateRunes(strings.TrimSpace(string(body)), tavilyErrBodyShow)
+		bodyStr := util.TruncateRunes(strings.TrimSpace(string(body)), tavilyErrBodyShow)
 		return tool.ToolResult{Error: fmt.Sprintf("Tavily API 错误 (HTTP %d): %s",
 			resp.StatusCode, bodyStr)}, nil
 	}

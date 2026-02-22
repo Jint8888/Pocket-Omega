@@ -278,3 +278,28 @@ func TestJaccardSimilarity_BothEmpty(t *testing.T) {
 		t.Fatalf("expected 1.0 for bigrams of empty strings, got %f", j2)
 	}
 }
+
+// ── isSearchTool tests ──
+
+func TestIsSearchTool_IncludesBrave(t *testing.T) {
+	tests := []struct {
+		name string
+		tool string
+		want bool
+	}{
+		{"web_search", "web_search", true},
+		{"search_tavily", "search_tavily", true},
+		{"search_brave", "search_brave", true},
+		{"mcp_search_tool", "mcp_google_search", true},
+		{"file_read", "file_read", false},
+		{"shell_exec", "shell_exec", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isSearchTool(tt.tool)
+			if got != tt.want {
+				t.Errorf("isSearchTool(%q) = %v, want %v", tt.tool, got, tt.want)
+			}
+		})
+	}
+}

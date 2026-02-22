@@ -23,9 +23,9 @@ import (
 //go:embed prompts/*
 var defaultPrompts embed.FS
 
-// dangerousPatterns contains lowercased substrings that indicate prompt injection attempts.
+// promptInjectionPatterns contains lowercased substrings that indicate prompt injection attempts.
 // Lines matching any pattern are dropped from L3 user rules with a warning.
-var dangerousPatterns = []string{
+var promptInjectionPatterns = []string{
 	"ignore previous",
 	"ignore above",
 	"ignore all previous",
@@ -240,7 +240,7 @@ func filterDangerousLines(content string) string {
 	for _, line := range lines {
 		lower := strings.ToLower(line)
 		dropped := false
-		for _, pattern := range dangerousPatterns {
+		for _, pattern := range promptInjectionPatterns {
 			if strings.Contains(lower, pattern) {
 				log.Printf("[Prompt] Warning: user rules line dropped (injection pattern %q detected): %q", pattern, line)
 				dropped = true

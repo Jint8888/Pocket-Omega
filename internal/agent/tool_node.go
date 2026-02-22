@@ -20,7 +20,10 @@ func NewToolNode(registry *tool.Registry) *ToolNodeImpl {
 	return &ToolNodeImpl{registry: registry}
 }
 
-// Prep reads LastDecision and converts ToolParams (map[string]any) to json.RawMessage.
+// Prep reads LastDecision, resolves the tool from state.ToolRegistry (per-request),
+// and converts ToolParams (map[string]any) to json.RawMessage.
+// Using state.ToolRegistry instead of n.registry ensures per-request tools
+// (e.g. update_plan injected via Registry.WithExtra) are accessible.
 func (n *ToolNodeImpl) Prep(state *AgentState) []ToolPrep {
 	if state.LastDecision == nil {
 		return nil
@@ -33,17 +36,24 @@ func (n *ToolNodeImpl) Prep(state *AgentState) []ToolPrep {
 		argsJSON = []byte("{}")
 	}
 
+	// Resolve tool from per-request registry; fall back to build-time registry if nil.
+	reg := state.ToolRegistry
+	if reg == nil {
+		reg = n.registry
+	}
+	resolved, _ := reg.Get(state.LastDecision.ToolName)
+
 	return []ToolPrep{{
-		ToolName:   state.LastDecision.ToolName,
-		Args:       argsJSON,
-		ToolCallID: state.LastDecision.ToolCallID,
+		ToolName:     state.LastDecision.ToolName,
+		Args:         argsJSON,
+		ToolCallID:   state.LastDecision.ToolCallID,
+		ResolvedTool: resolved,
 	}}
 }
 
-// Exec looks up the tool in the registry and executes it.
+// Exec executes the pre-resolved tool carried in ToolPrep.
 func (n *ToolNodeImpl) Exec(ctx context.Context, prep ToolPrep) (ToolExecResult, error) {
-	t, ok := n.registry.Get(prep.ToolName)
-	if !ok {
+	if prep.ResolvedTool == nil {
 		return ToolExecResult{
 			ToolName:   prep.ToolName,
 			Error:      fmt.Sprintf("工具 %q 未找到", prep.ToolName),
@@ -51,7 +61,7 @@ func (n *ToolNodeImpl) Exec(ctx context.Context, prep ToolPrep) (ToolExecResult,
 		}, nil
 	}
 
-	result, err := t.Execute(ctx, json.RawMessage(prep.Args))
+	result, err := prep.ResolvedTool.Execute(ctx, json.RawMessage(prep.Args))
 	if err != nil {
 		return ToolExecResult{
 			ToolName:   prep.ToolName,

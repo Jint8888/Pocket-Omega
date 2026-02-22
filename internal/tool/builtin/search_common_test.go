@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/pocketomega/pocket-omega/internal/util"
 )
 
 func TestParseSearchQuery_Valid(t *testing.T) {
@@ -56,11 +58,11 @@ func TestParseSearchQuery_BadJSON(t *testing.T) {
 	}
 }
 
-// ── truncateRunes ─────────────────────────────────────────────────────────────
+// ── util.TruncateRunes ────────────────────────────────────────────────────────
 
 func TestTruncateRunes_NoTruncation(t *testing.T) {
 	s := "hello"
-	got := truncateRunes(s, 10)
+	got := util.TruncateRunes(s, 10)
 	if got != s {
 		t.Errorf("should not truncate: got %q, want %q", got, s)
 	}
@@ -68,14 +70,14 @@ func TestTruncateRunes_NoTruncation(t *testing.T) {
 
 func TestTruncateRunes_ExactLimit(t *testing.T) {
 	s := "hello"
-	got := truncateRunes(s, 5)
+	got := util.TruncateRunes(s, 5)
 	if got != s {
 		t.Errorf("at exact limit should not truncate: got %q, want %q", got, s)
 	}
 }
 
 func TestTruncateRunes_Truncated(t *testing.T) {
-	got := truncateRunes("hello world", 5)
+	got := util.TruncateRunes("hello world", 5)
 	if !strings.HasPrefix(got, "hello") {
 		t.Errorf("got %q, should start with 'hello'", got)
 	}
@@ -85,7 +87,7 @@ func TestTruncateRunes_Truncated(t *testing.T) {
 }
 
 func TestTruncateRunes_Chinese(t *testing.T) {
-	got := truncateRunes("你好世界测试", 4)
+	got := util.TruncateRunes("你好世界测试", 4)
 	prefix := strings.TrimSuffix(got, "...")
 	if len([]rune(prefix)) != 4 {
 		t.Errorf("prefix should have 4 runes, got %d in %q", len([]rune(prefix)), got)
@@ -96,7 +98,7 @@ func TestTruncateRunes_Chinese(t *testing.T) {
 }
 
 func TestTruncateRunes_EmptyString(t *testing.T) {
-	got := truncateRunes("", 5)
+	got := util.TruncateRunes("", 5)
 	if got != "" {
 		t.Errorf("empty string should return empty, got %q", got)
 	}
@@ -193,15 +195,15 @@ func TestParseSearchQuery_AtLimit(t *testing.T) {
 func TestTruncateRunes_ZeroLimit(t *testing.T) {
 	// maxRunes <= 0 should return s unchanged (no panic).
 	s := "hello"
-	if got := truncateRunes(s, 0); got != s {
-		t.Errorf("truncateRunes(s, 0) = %q, want %q (unchanged)", got, s)
+	if got := util.TruncateRunes(s, 0); got != s {
+		t.Errorf("TruncateRunes(s, 0) = %q, want %q (unchanged)", got, s)
 	}
 }
 
 func TestTruncateRunes_NegativeLimit(t *testing.T) {
 	// Negative maxRunes should return s unchanged (no panic).
 	s := "hello"
-	if got := truncateRunes(s, -5); got != s {
-		t.Errorf("truncateRunes(s, -5) = %q, want %q (unchanged)", got, s)
+	if got := util.TruncateRunes(s, -5); got != s {
+		t.Errorf("TruncateRunes(s, -5) = %q, want %q (unchanged)", got, s)
 	}
 }

@@ -112,7 +112,7 @@ func GetContextWindow(modelName string) int {
 		// DeepSeek
 		{"deepseek-r1", 64_000},
 		{"deepseek-r2", 64_000},
-		{"deepseek-v3", 64_000},
+		{"deepseek-v3", 128_000},
 		{"deepseek-v2", 128_000},
 		{"deepseek", 64_000},
 		// Google Gemini

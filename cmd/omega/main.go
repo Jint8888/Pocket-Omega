@@ -14,6 +14,7 @@ import (
 	"github.com/pocketomega/pocket-omega/internal/agent"
 	"github.com/pocketomega/pocket-omega/internal/llm/openai"
 	"github.com/pocketomega/pocket-omega/internal/mcp"
+	"github.com/pocketomega/pocket-omega/internal/plan"
 	"github.com/pocketomega/pocket-omega/internal/prompt"
 	"github.com/pocketomega/pocket-omega/internal/runtime"
 	"github.com/pocketomega/pocket-omega/internal/session"
@@ -82,6 +83,7 @@ func main() {
 	// P2 — extended file operations (unconditional)
 	registry.Register(builtin.NewFileDeleteTool(workspaceDir))
 	registry.Register(builtin.NewFilePatchTool(workspaceDir))
+	registry.Register(builtin.NewGitInfoTool(workspaceDir))
 
 	// Config edit tool — allows agent to modify config files outside workspace sandbox.
 	// Uses an allowlist so only explicitly named files are accessible.
@@ -232,6 +234,9 @@ func main() {
 	defer sessionStore.Close()
 	fmt.Printf("💬 Session: TTL=%v MaxTurns=%d\n", sessionTTL, sessionMaxTurns)
 
+	// Initialize plan store for structured task tracking
+	planStore := plan.NewPlanStore()
+
 	// Create handlers
 	thinkingMode := llmClient.GetConfig().ResolveThinkingMode()
 	toolCallMode := llmClient.GetConfig().ToolCallMode // raw value: "auto", "fc", or "yaml"
@@ -250,6 +255,7 @@ func main() {
 		OSName:              osName,
 		ShellCmd:            shellCmd,
 		ModelName:           llmClient.GetConfig().Model,
+		PlanStore:           planStore,
 	})
 	fmt.Printf("🧠 Thinking: %s\n", thinkingMode)
 	fmt.Printf("🔧 ToolCall: %s (resolved: %s)\n", toolCallMode, llmClient.GetConfig().ResolveToolCallMode())

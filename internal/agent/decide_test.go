@@ -706,3 +706,168 @@ func TestParseDecision_HeadlineOmitEmpty(t *testing.T) {
 		t.Errorf("Headline = %q, want empty string when omitted", decision.Headline)
 	}
 }
+
+// ── FC Reason recovery tests ──
+
+func TestExecWithFC_ReasonFromContent(t *testing.T) {
+	// When model returns both Content (reasoning) and ToolCalls, Reason should use Content.
+	mock := &mockLLMProvider{
+		callLLMWithToolsResp: llm.Message{
+			Role:    llm.RoleAssistant,
+			Content: "需要先列出目录结构了解项目布局",
+			ToolCalls: []llm.ToolCall{
+				{ID: "call_1", Name: "file_list", Arguments: []byte(`{"path":"."}`)},
+			},
+		},
+		supportsFC: true,
+	}
+	node := NewDecideNode(mock, nil)
+	prep := DecidePrep{
+		Problem:      "帮我分析项目结构",
+		ToolCallMode: "fc",
+		ToolDefinitions: []llm.ToolDefinition{
+			{Name: "file_list", Description: "list files"},
+		},
+	}
+	decision, err := node.Exec(context.Background(), prep)
+	if err != nil {
+		t.Fatalf("Exec() error: %v", err)
+	}
+	if decision.Reason == "FC: call file_list" {
+		t.Error("Reason should use Content text, not hardcoded FC prefix")
+	}
+	if !strings.Contains(decision.Reason, "列出目录") {
+		t.Errorf("Reason should contain Content text, got: %q", decision.Reason)
+	}
+}
+
+func TestExecWithFC_ReasonFallbackWhenNoContent(t *testing.T) {
+	// When model returns ToolCalls without Content, Reason should fallback to "FC: call xxx".
+	mock := &mockLLMProvider{
+		callLLMWithToolsResp: llm.Message{
+			Role: llm.RoleAssistant,
+			ToolCalls: []llm.ToolCall{
+				{ID: "call_2", Name: "file_read", Arguments: []byte(`{"path":"test.txt"}`)},
+			},
+		},
+		supportsFC: true,
+	}
+	node := NewDecideNode(mock, nil)
+	prep := DecidePrep{
+		Problem:      "读取文件",
+		ToolCallMode: "fc",
+		ToolDefinitions: []llm.ToolDefinition{
+			{Name: "file_read", Description: "read file"},
+		},
+	}
+	decision, err := node.Exec(context.Background(), prep)
+	if err != nil {
+		t.Fatalf("Exec() error: %v", err)
+	}
+	if decision.Reason != "FC: call file_read" {
+		t.Errorf("Reason should fallback to FC prefix, got: %q", decision.Reason)
+	}
+}
+
+func TestExecWithFC_ReasonTruncation(t *testing.T) {
+	// When Content exceeds 200 chars, Reason should be truncated.
+	longContent := strings.Repeat("这是一段很长的推理文字", 30) // ~330 chars
+	mock := &mockLLMProvider{
+		callLLMWithToolsResp: llm.Message{
+			Role:    llm.RoleAssistant,
+			Content: longContent,
+			ToolCalls: []llm.ToolCall{
+				{ID: "call_3", Name: "file_list", Arguments: []byte(`{"path":"."}`)},
+			},
+		},
+		supportsFC: true,
+	}
+	node := NewDecideNode(mock, nil)
+	prep := DecidePrep{
+		Problem:      "test truncation",
+		ToolCallMode: "fc",
+		ToolDefinitions: []llm.ToolDefinition{
+			{Name: "file_list", Description: "list files"},
+		},
+	}
+	decision, err := node.Exec(context.Background(), prep)
+	if err != nil {
+		t.Fatalf("Exec() error: %v", err)
+	}
+	runes := []rune(decision.Reason)
+	// truncate(s, 200) produces 200 runes + "..." suffix
+	if len(runes) > 210 {
+		t.Errorf("Reason should be truncated to ~200 runes, got %d runes", len(runes))
+	}
+	if !strings.HasSuffix(decision.Reason, "...") {
+		t.Errorf("Truncated Reason should end with '...', got: %q", decision.Reason[len(decision.Reason)-10:])
+	}
+}
+
+// ── StepSummary duplicate detection tests ──
+
+func TestBuildStepSummary_DuplicateWarning(t *testing.T) {
+	// Repeated file_list with same path should produce inline ⚠️ warning.
+	steps := []StepRecord{
+		{StepNumber: 1, Type: "tool", ToolName: "file_list", Input: `{"path":"."}`, Output: "file1.go\nfile2.go"},
+		{StepNumber: 2, Type: "decide", Action: "tool", Input: "FC: call file_read"},
+		{StepNumber: 3, Type: "tool", ToolName: "file_read", Input: `{"path":"test.txt"}`, Output: "content"},
+		{StepNumber: 4, Type: "tool", ToolName: "file_list", Input: `{"path":"."}`, Output: "file1.go\nfile2.go"},
+	}
+	summary := buildStepSummary(steps, 0)
+	if !strings.Contains(summary, "⚠️") {
+		t.Error("summary should contain duplicate warning for repeated file_list(.)")
+	}
+	if !strings.Contains(summary, "步骤1重复") {
+		t.Error("warning should reference step 1 as the first occurrence")
+	}
+}
+
+func TestBuildStepSummary_NoDuplicateForDifferentParams(t *testing.T) {
+	// file_read with different paths should NOT trigger duplicate warning.
+	steps := []StepRecord{
+		{StepNumber: 1, Type: "tool", ToolName: "file_read", Input: `{"path":"a.txt"}`, Output: "aaa"},
+		{StepNumber: 2, Type: "tool", ToolName: "file_read", Input: `{"path":"b.txt"}`, Output: "bbb"},
+	}
+	summary := buildStepSummary(steps, 0)
+	if strings.Contains(summary, "⚠️") {
+		t.Error("different paths should NOT trigger duplicate warning")
+	}
+}
+
+func TestBuildStepSummary_ShellExecNoDuplicateForDifferentCommands(t *testing.T) {
+	// shell_exec with different commands should NOT trigger duplicate warning.
+	steps := []StepRecord{
+		{StepNumber: 1, Type: "tool", ToolName: "shell_exec", Input: `{"command":"dir"}`, Output: "listing"},
+		{StepNumber: 2, Type: "tool", ToolName: "shell_exec", Input: `{"command":"type test.txt"}`, Output: "content"},
+	}
+	summary := buildStepSummary(steps, 0)
+	if strings.Contains(summary, "⚠️") {
+		t.Error("different commands should NOT trigger duplicate warning")
+	}
+}
+
+func TestBuildStepSummary_NoDuplicateForSearchTool(t *testing.T) {
+	// search tools (not in paramDedupTools) called with different queries
+	// must NOT produce a duplicate warning — different queries are legitimate.
+	steps := []StepRecord{
+		{StepNumber: 1, Type: "tool", ToolName: "search_tavily", Input: `{"query":"golang channel 教程"}`, Output: "result A"},
+		{StepNumber: 2, Type: "tool", ToolName: "search_tavily", Input: `{"query":"goroutine 最佳实践"}`, Output: "result B"},
+	}
+	summary := buildStepSummary(steps, 0)
+	if strings.Contains(summary, "⚠️") {
+		t.Errorf("different queries on search tool should NOT trigger duplicate warning, got:\n%s", summary)
+	}
+}
+
+func TestBuildStepSummary_NoDuplicateForWebReader(t *testing.T) {
+	// web_reader with different URLs should NOT trigger duplicate warning.
+	steps := []StepRecord{
+		{StepNumber: 1, Type: "tool", ToolName: "web_reader", Input: `{"url":"https://go.dev/doc"}`, Output: "page A"},
+		{StepNumber: 2, Type: "tool", ToolName: "web_reader", Input: `{"url":"https://pkg.go.dev/fmt"}`, Output: "page B"},
+	}
+	summary := buildStepSummary(steps, 0)
+	if strings.Contains(summary, "⚠️") {
+		t.Errorf("different URLs on web_reader should NOT trigger duplicate warning, got:\n%s", summary)
+	}
+}

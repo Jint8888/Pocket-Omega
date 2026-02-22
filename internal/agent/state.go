@@ -91,9 +91,10 @@ type Decision struct {
 
 // ToolPrep is prepared by reading LastDecision and converting ToolParams.
 type ToolPrep struct {
-	ToolName   string
-	Args       []byte // json.RawMessage from json.Marshal(Decision.ToolParams)
-	ToolCallID string // FC only: correlates tool result with the model's tool call
+	ToolName     string
+	Args         []byte    // json.RawMessage from json.Marshal(Decision.ToolParams)
+	ToolCallID   string    // FC only: correlates tool result with the model's tool call
+	ResolvedTool tool.Tool // resolved in Prep from state.ToolRegistry; nil = not found
 }
 
 // ToolExecResult is the result of executing a tool.

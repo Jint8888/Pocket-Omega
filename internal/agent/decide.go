@@ -14,6 +14,7 @@ import (
 	"github.com/pocketomega/pocket-omega/internal/prompt"
 	"github.com/pocketomega/pocket-omega/internal/thinking"
 	"github.com/pocketomega/pocket-omega/internal/tool"
+	"github.com/pocketomega/pocket-omega/internal/util"
 	"gopkg.in/yaml.v3"
 )
 
@@ -142,9 +143,17 @@ func (n *DecideNode) execWithFC(ctx context.Context, prep DecidePrep) (Decision,
 			return Decision{}, fmt.Errorf("invalid tool params from FC: %w", err)
 		}
 
+		// Extract reasoning from Content if model provided it alongside tool calls
+		reason := strings.TrimSpace(resp.Content)
+		if reason == "" {
+			reason = fmt.Sprintf("FC: call %s", tc.Name)
+		} else {
+			reason = truncate(reason, 200)
+		}
+
 		return Decision{
 			Action:     "tool",
-			Reason:     fmt.Sprintf("FC: call %s", tc.Name),
+			Reason:     reason,
 			ToolName:   tc.Name,
 			ToolParams: params,
 			ToolCallID: tc.ID,
@@ -401,20 +410,38 @@ const decideL1Native = `你是一个智能助手，根据用户问题和当前�
 
 你可以选择两种行动：
 1. tool — 调用工具获取信息或执行操作
-2. answer — 直接回答用户问题`
+2. answer — 直接回答用户问题
+
+## 核心行为准则
+- **禁止重复**：已完成步骤中出现过的相同工具+参数调用不再执行
+- **先规划**：多步任务在首次回复中简述执行计划
+- **及时结束**：任务完成后立即文本回复，不做多余验证
+- **合并操作**：shell 命令可组合时优先组合执行`
 
 const decideL1App = `你是一个智能助手，根据用户问题和当前上下文，决定下一步行动。
 
 你可以选择三种行动：
 1. tool — 调用工具获取信息或执行操作
 2. think — 进行深度推理分析
-3. answer — 直接回答用户问题`
+3. answer — 直接回答用户问题
+
+## 核心行为准则
+- **禁止重复**：已完成步骤中出现过的相同工具+参数调用不再执行
+- **先规划**：多步任务在首次回复中简述执行计划
+- **及时结束**：任务完成后立即文本回复，不做多余验证
+- **合并操作**：shell 命令可组合时优先组合执行`
 
 const decideL1FC = `你是一个智能助手，根据用户问题和当前上下文，决定下一步行动。
 
 你有两种选择：
 1. 调用工具 — 通过 function calling 调用合适的工具
-2. 直接回答 — 如果已有足够信息或问题简单，直接用文本回复`
+2. 直接回答 — 如果已有足够信息或问题简单，直接用文本回复
+
+## 核心行为准则
+- **禁止重复**：已完成步骤中出现过的相同工具+参数调用不再执行
+- **先规划**：多步任务在首次回复中简述执行计划
+- **及时结束**：任务完成后立即文本回复，不做多余验证
+- **合并操作**：shell 命令可组合时优先组合执行`
 
 // buildDecidePromptFC builds the user prompt for FC mode (no YAML template).
 func buildDecidePromptFC(prep DecidePrep) string {
@@ -431,6 +458,18 @@ func buildDecidePromptFC(prep DecidePrep) string {
 
 	if prep.StepSummary != "" {
 		sb.WriteString(fmt.Sprintf("已完成步骤：\n%s\n\n", prep.StepSummary))
+	}
+
+	// When task is long, remind LLM of available tool names
+	if prep.StepCount > 3 && len(prep.ToolDefinitions) > 0 {
+		sb.WriteString("可用工具：")
+		for i, td := range prep.ToolDefinitions {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(td.Name)
+		}
+		sb.WriteString("\n\n")
 	}
 
 	// Add urgency when step budget is running low
@@ -557,6 +596,13 @@ func buildStepSummary(steps []StepRecord, contextWindowTokens int) string {
 	// Tool steps with index >= this threshold get full output
 	fullOutputThreshold := toolCount - recentWindowSize
 
+	// Duplicate detection: track first occurrence of each tool+param combination
+	type toolCallKey struct {
+		name  string
+		param string // key parameter value (e.g. path for file tools, command for shell)
+	}
+	seen := make(map[toolCallKey]int) // key → first step number
+
 	var sb strings.Builder
 	toolIdx := 0
 	for _, s := range steps {
@@ -564,12 +610,29 @@ func buildStepSummary(steps []StepRecord, contextWindowTokens int) string {
 		case "decide":
 			sb.WriteString(fmt.Sprintf("  步骤 %d [决策]: %s → %s\n", s.StepNumber, s.Action, s.Input))
 		case "tool":
+			// Only perform dedup for tools with a registered key parameter.
+			// Tools not in paramDedupTools (e.g. search_tavily, http_request, web_reader)
+			// may legitimately be called multiple times with different parameters —
+			// skip dedup tracking for them to avoid false-positive warnings.
+			dupWarning := ""
+			if paramName, ok := paramDedupTools[s.ToolName]; ok {
+				key := toolCallKey{
+					name:  s.ToolName,
+					param: extractParam(s.Input, paramName),
+				}
+				if firstStep, exists := seen[key]; exists {
+					dupWarning = fmt.Sprintf(" ⚠️[与步骤%d重复，可复用其结果]", firstStep)
+				} else {
+					seen[key] = s.StepNumber
+				}
+			}
+
 			if toolIdx >= fullOutputThreshold {
 				// Recent tool step — keep full output within model-aware budget
-				sb.WriteString(fmt.Sprintf("  步骤 %d [工具 %s]: %s\n", s.StepNumber, s.ToolName, truncate(s.Output, perStepOutputBudget(contextWindowTokens))))
+				sb.WriteString(fmt.Sprintf("  步骤 %d [工具 %s]: %s%s\n", s.StepNumber, s.ToolName, truncate(s.Output, perStepOutputBudget(contextWindowTokens)), dupWarning))
 			} else {
 				// Old tool step — one-line summary
-				sb.WriteString(fmt.Sprintf("  步骤 %d [工具 %s]: 已执行 (%s)，输出 %d bytes\n", s.StepNumber, s.ToolName, truncate(s.Input, 80), len(s.Output)))
+				sb.WriteString(fmt.Sprintf("  步骤 %d [工具 %s]: 已执行 (%s)，输出 %d bytes%s\n", s.StepNumber, s.ToolName, truncate(s.Input, 80), len(s.Output), dupWarning))
 			}
 			toolIdx++
 		case "think":
@@ -626,13 +689,7 @@ func fixBackslashes(s string) string {
 	})
 }
 
-func truncate(s string, maxLen int) string {
-	runes := []rune(s)
-	if len(runes) <= maxLen {
-		return s
-	}
-	return string(runes[:maxLen]) + "..."
-}
+func truncate(s string, maxLen int) string { return util.TruncateRunes(s, maxLen) }
 
 // parseNativeFCContent extracts a tool call from models (e.g. Kimi-K2.5) that
 // embed FC intent in the Content field using special tokens rather than the
@@ -694,9 +751,17 @@ func parseNativeFCContent(content string, toolDefs []llm.ToolDefinition) (Decisi
 		}
 	}
 
+	// Extract reasoning text before FC tokens (content before <|tool_calls_section_begin|>)
+	reason := strings.TrimSpace(content[:startIdx])
+	if reason == "" {
+		reason = fmt.Sprintf("native FC: call %s", tc.Name)
+	} else {
+		reason = truncate(reason, 200)
+	}
+
 	return Decision{
 		Action:     "tool",
-		Reason:     fmt.Sprintf("native FC: call %s", tc.Name),
+		Reason:     reason,
 		ToolName:   tc.Name,
 		ToolParams: params,
 	}, true

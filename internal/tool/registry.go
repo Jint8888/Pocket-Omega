@@ -126,3 +126,20 @@ func (r *Registry) CloseAll() {
 		}
 	}
 }
+
+// WithExtra returns a shallow copy of this Registry with additional tools appended.
+// Used for per-request tool injection (e.g. update_plan with session context).
+// The returned Registry has an independent map; Tool instances themselves are shared
+// by reference but are designed to be stateless or self-synchronized.
+func (r *Registry) WithExtra(extras ...Tool) *Registry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	cp := &Registry{tools: make(map[string]Tool, len(r.tools)+len(extras))}
+	for k, v := range r.tools {
+		cp.tools[k] = v
+	}
+	for _, t := range extras {
+		cp.tools[t.Name()] = t
+	}
+	return cp
+}
