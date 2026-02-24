@@ -7,7 +7,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/pocketomega/pocket-omega/internal/core"
 	"github.com/pocketomega/pocket-omega/internal/llm"
+	"github.com/pocketomega/pocket-omega/internal/plan"
 	"github.com/pocketomega/pocket-omega/internal/tool"
 )
 
@@ -585,11 +587,15 @@ func TestContainsMCPKeywords_Positive(t *testing.T) {
 		{"bare mcp", "帮我配置 mcp 工具"},
 		{"uppercase MCP", "Can you add an MCP server?"},
 		{"技能", "我想新建一个技能"},
-		{"skill lowercase", "create a new skill for me"},
-		{"SKILL uppercase", "Add a SKILL"},
 		{"自定义工具", "我要创建一个自定义工具"},
 		{"custom tool", "I need a custom tool"},
 		{"mcp embedded in sentence", "how do I set up an mcp-based plugin"},
+		{"exact 创建工具", "帮我创建工具"},
+		{"exact 新建工具", "新建工具来处理数据"},
+		// Word-bag matches (words separated by other tokens)
+		{"word-bag build+tool", "build a tool for excel"},
+		{"word-bag create+tool", "create new tool please"},
+		{"word-bag custom+tool", "I need a custom data processing tool"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -611,6 +617,13 @@ func TestContainsMCPKeywords_Negative(t *testing.T) {
 		{"plain question", "what is the weather today?"},
 		{"server without mcp", "restart the server"},
 		{"chinese unrelated", "帮我查询一下北京天气"},
+		// "skill" alone no longer triggers (too broad)
+		{"skill without action context", "create a new skill for me"},
+		{"SKILL uppercase alone", "Add a SKILL"},
+		{"coding skill", "improve my coding skill"},
+		{"what skills", "what skills do you have"},
+		// Only one word from intent phrase
+		{"build without tool", "use the build command"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -834,5 +847,669 @@ func TestBuildStepSummary_NoDuplicateForWebReader(t *testing.T) {
 	summary := buildStepSummary(steps, 0)
 	if strings.Contains(summary, "⚠️") {
 		t.Errorf("different URLs on web_reader should NOT trigger duplicate warning, got:\n%s", summary)
+	}
+}
+
+// ── Dual-Zone Layout tests ──
+
+func TestBuildStepSummary_ZoneLayout(t *testing.T) {
+	// With more tool steps than window size, Zone A header should appear before Zone B header.
+	steps := make([]StepRecord, 0, 10)
+	for i := 1; i <= 6; i++ {
+		steps = append(steps, StepRecord{
+			StepNumber: i, Type: "tool", ToolName: "file_read",
+			Input:  fmt.Sprintf(`{"path":"file%d.go"}`, i),
+			Output: fmt.Sprintf("content of file%d", i),
+		})
+	}
+	summary := buildStepSummary(steps, 0)
+
+	zoneAPos := strings.Index(summary, "--- 最近工具结果 ---")
+	zoneBPos := strings.Index(summary, "--- 执行历史 ---")
+	if zoneAPos < 0 {
+		t.Fatal("Zone A header '--- 最近工具结果 ---' not found in summary")
+	}
+	if zoneBPos < 0 {
+		t.Fatal("Zone B header '--- 执行历史 ---' not found in summary")
+	}
+	if zoneAPos >= zoneBPos {
+		t.Errorf("Zone A (pos %d) should appear before Zone B (pos %d)", zoneAPos, zoneBPos)
+	}
+}
+
+func TestBuildStepSummary_ZoneANewestFirst(t *testing.T) {
+	// Zone A should render steps in newest-first order.
+	steps := []StepRecord{
+		{StepNumber: 1, Type: "tool", ToolName: "file_read", Input: `{"path":"old.go"}`, Output: "old"},
+		{StepNumber: 2, Type: "tool", ToolName: "file_read", Input: `{"path":"mid.go"}`, Output: "mid"},
+		{StepNumber: 3, Type: "tool", ToolName: "file_read", Input: `{"path":"a.go"}`, Output: "a"},
+		{StepNumber: 4, Type: "tool", ToolName: "file_read", Input: `{"path":"b.go"}`, Output: "b"},
+		{StepNumber: 5, Type: "tool", ToolName: "file_read", Input: `{"path":"c.go"}`, Output: "c"},
+	}
+	summary := buildStepSummary(steps, 0)
+
+	// Zone A should contain steps 3, 4, 5 (last 3) in newest-first order: 5, 4, 3
+	pos5 := strings.Index(summary, "步骤 5")
+	pos4 := strings.Index(summary, "步骤 4")
+	pos3 := strings.Index(summary, "步骤 3")
+	if pos5 < 0 || pos4 < 0 || pos3 < 0 {
+		t.Fatalf("Zone A steps not found in summary:\n%s", summary)
+	}
+	if !(pos5 < pos4 && pos4 < pos3) {
+		t.Errorf("Zone A should be newest-first: step5(pos %d) < step4(pos %d) < step3(pos %d)", pos5, pos4, pos3)
+	}
+}
+
+func TestBuildStepSummary_DecideStepsOmitted(t *testing.T) {
+	// Decide steps should not appear in the summary.
+	steps := []StepRecord{
+		{StepNumber: 1, Type: "tool", ToolName: "file_read", Input: `{"path":"a.go"}`, Output: "content"},
+		{StepNumber: 2, Type: "decide", Action: "tool", Input: "FC: call file_read"},
+		{StepNumber: 3, Type: "tool", ToolName: "file_read", Input: `{"path":"b.go"}`, Output: "content2"},
+	}
+	summary := buildStepSummary(steps, 0)
+	if strings.Contains(summary, "[决策]") {
+		t.Errorf("decide steps should be omitted from summary, got:\n%s", summary)
+	}
+	if strings.Contains(summary, "步骤 2") {
+		t.Errorf("step 2 (decide) should not appear in summary, got:\n%s", summary)
+	}
+}
+
+func TestBuildStepSummary_MetaToolNotInZoneA(t *testing.T) {
+	// Meta-tools (update_plan, walkthrough) should not appear in Zone A,
+	// but should appear in Zone B as ultra-compact one-liners for LLM memory.
+	steps := []StepRecord{
+		{StepNumber: 1, Type: "tool", ToolName: "file_read", Input: `{"path":"a.go"}`, Output: "old content"},
+		{StepNumber: 2, Type: "tool", ToolName: "file_read", Input: `{"path":"b.go"}`, Output: "old content 2"},
+		{StepNumber: 3, Type: "tool", ToolName: "update_plan", Input: `{"plan":"step1"}`, Output: "plan updated"},
+		{StepNumber: 4, Type: "tool", ToolName: "walkthrough", Input: `{"content":"note"}`, Output: "noted"},
+		{StepNumber: 5, Type: "tool", ToolName: "file_read", Input: `{"path":"c.go"}`, Output: "new content"},
+		{StepNumber: 6, Type: "tool", ToolName: "file_read", Input: `{"path":"d.go"}`, Output: "new content 2"},
+		{StepNumber: 7, Type: "tool", ToolName: "file_read", Input: `{"path":"e.go"}`, Output: "newest content"},
+	}
+	summary := buildStepSummary(steps, 0)
+
+	// Zone A should contain the 3 most recent non-meta tool steps: 5, 6, 7
+	zoneAHeader := strings.Index(summary, "--- 最近工具结果 ---")
+	zoneBHeader := strings.Index(summary, "--- 执行历史 ---")
+	if zoneAHeader < 0 || zoneBHeader < 0 {
+		t.Fatalf("zone headers not found in summary:\n%s", summary)
+	}
+
+	zoneA := summary[zoneAHeader:zoneBHeader]
+	// Meta-tools should NOT be in Zone A
+	if strings.Contains(zoneA, "update_plan") {
+		t.Error("update_plan should not be in Zone A")
+	}
+	if strings.Contains(zoneA, "walkthrough") {
+		t.Error("walkthrough should not be in Zone A")
+	}
+	// Steps 5, 6, 7 should be in Zone A
+	if !strings.Contains(zoneA, "步骤 7") || !strings.Contains(zoneA, "步骤 6") || !strings.Contains(zoneA, "步骤 5") {
+		t.Errorf("Zone A should contain steps 5, 6, 7, got:\n%s", zoneA)
+	}
+
+	// Meta-tools SHOULD appear in Zone B as ultra-compact one-liners
+	zoneB := summary[zoneBHeader:]
+	if !strings.Contains(zoneB, "update_plan") || !strings.Contains(zoneB, "✓ 已调用") {
+		t.Errorf("update_plan should appear in Zone B as compact one-liner, got:\n%s", zoneB)
+	}
+	if !strings.Contains(zoneB, "walkthrough") {
+		t.Errorf("walkthrough should appear in Zone B as compact one-liner, got:\n%s", zoneB)
+	}
+	// Meta-tools in Zone B should NOT contain output details
+	if strings.Contains(zoneB, "plan updated") || strings.Contains(zoneB, "noted") {
+		t.Errorf("meta-tool Zone B entries should not contain output details, got:\n%s", zoneB)
+	}
+}
+
+func TestBuildStepSummary_DynamicWindow(t *testing.T) {
+	// With 20+ non-meta tool steps, window should expand to 5.
+	steps := make([]StepRecord, 0, 22)
+	for i := 1; i <= 22; i++ {
+		steps = append(steps, StepRecord{
+			StepNumber: i, Type: "tool", ToolName: "file_read",
+			Input:  fmt.Sprintf(`{"path":"file%d.go"}`, i),
+			Output: fmt.Sprintf("content %d", i),
+		})
+	}
+	summary := buildStepSummary(steps, 0)
+
+	// Zone A should contain the last 5 steps (18-22) with full output
+	for i := 18; i <= 22; i++ {
+		marker := fmt.Sprintf("步骤 %d [工具 file_read]: content %d", i, i)
+		if !strings.Contains(summary, marker) {
+			t.Errorf("Zone A should contain step %d with full output, got:\n%s", i, summary)
+		}
+	}
+	// Step 17 should be in Zone B (compressed)
+	if !strings.Contains(summary, "步骤 17 [工具 file_read]: 已执行") {
+		t.Errorf("Step 17 should be in Zone B (compressed), got:\n%s", summary)
+	}
+}
+
+func TestBuildStepSummary_FewStepsNoHeaders(t *testing.T) {
+	// When all tool steps fit in the window, no zone headers should appear.
+	steps := []StepRecord{
+		{StepNumber: 1, Type: "tool", ToolName: "file_read", Input: `{"path":"a.go"}`, Output: "content a"},
+		{StepNumber: 2, Type: "tool", ToolName: "file_read", Input: `{"path":"b.go"}`, Output: "content b"},
+	}
+	summary := buildStepSummary(steps, 0)
+	if strings.Contains(summary, "---") {
+		t.Errorf("few steps should not produce zone headers, got:\n%s", summary)
+	}
+	// Both steps should have full output (not compressed)
+	if strings.Contains(summary, "已执行") {
+		t.Errorf("all steps should have full output when within window, got:\n%s", summary)
+	}
+}
+
+// ── LoopDetector streak self-correction tests ──
+
+func TestLoopDetector_SelfCorrectionResetsStreak(t *testing.T) {
+	// When LoopDetector fires but LLM switches to a different tool,
+	// Post should reset streak (self-correction) instead of hard override.
+	node := NewDecideNode(&mockLLMProvider{}, nil)
+	state := &AgentState{
+		LoopDetectionStreak: 1, // already had one soft warning
+	}
+
+	// LLM chose shell_exec, but LoopDetector flagged file_read as the loop tool
+	decision := Decision{Action: "tool", ToolName: "shell_exec"}
+	prep := []DecidePrep{{
+		LoopDetected: DetectionResult{
+			Detected: true,
+			Rule:     "same_tool_freq",
+			ToolName: "file_read", // different from decision.ToolName
+		},
+	}}
+
+	action := node.Post(state, prep, decision)
+
+	if action != core.ActionTool {
+		t.Errorf("self-corrected tool should be allowed, got action=%s", action)
+	}
+	if state.LoopDetectionStreak != 0 {
+		t.Errorf("streak should reset on self-correction, got %d", state.LoopDetectionStreak)
+	}
+}
+
+func TestLoopDetector_SameToolHardOverride(t *testing.T) {
+	// When LoopDetector fires and LLM picks the SAME tool again (streak=2),
+	// Post should hard override to answer.
+	node := NewDecideNode(&mockLLMProvider{}, nil)
+	state := &AgentState{
+		LoopDetectionStreak: 1, // already had one soft warning
+	}
+
+	decision := Decision{Action: "tool", ToolName: "file_read"}
+	prep := []DecidePrep{{
+		LoopDetected: DetectionResult{
+			Detected: true,
+			Rule:     "same_tool_freq",
+			ToolName: "file_read", // same as decision.ToolName
+		},
+	}}
+
+	action := node.Post(state, prep, decision)
+
+	if action != core.ActionAnswer {
+		t.Errorf("same tool on streak=2 should hard override to answer, got action=%s", action)
+	}
+}
+
+func TestCountTrailingMetaTools(t *testing.T) {
+	tests := []struct {
+		name  string
+		steps []StepRecord
+		want  int
+	}{
+		{
+			"empty",
+			nil,
+			0,
+		},
+		{
+			"no meta tools",
+			[]StepRecord{
+				{Type: "tool", ToolName: "file_read"},
+				{Type: "tool", ToolName: "shell_exec"},
+			},
+			0,
+		},
+		{
+			"trailing meta tools",
+			[]StepRecord{
+				{Type: "tool", ToolName: "file_read"},
+				{Type: "tool", ToolName: "update_plan"},
+				{Type: "tool", ToolName: "update_plan"},
+				{Type: "tool", ToolName: "update_plan"},
+			},
+			3,
+		},
+		{
+			"meta tools with decide steps interleaved",
+			[]StepRecord{
+				{Type: "tool", ToolName: "file_read"},
+				{Type: "decide", Action: "tool"},
+				{Type: "tool", ToolName: "update_plan"},
+				{Type: "decide", Action: "tool"},
+				{Type: "tool", ToolName: "update_plan"},
+			},
+			2,
+		},
+		{
+			"non-meta tool breaks streak",
+			[]StepRecord{
+				{Type: "tool", ToolName: "update_plan"},
+				{Type: "tool", ToolName: "file_read"},
+				{Type: "tool", ToolName: "update_plan"},
+			},
+			1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := countTrailingMetaTools(tt.steps)
+			if got != tt.want {
+				t.Errorf("countTrailingMetaTools() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMetaToolGuard_ForcesAnswerOnConsecutiveMetaTools(t *testing.T) {
+	node := NewDecideNode(&mockLLMProvider{}, nil)
+
+	// Build history with 4 consecutive update_plan tool steps (hard limit = 4)
+	var steps []StepRecord
+	steps = append(steps, StepRecord{Type: "tool", ToolName: "file_read", StepNumber: 1})
+	for i := 2; i <= 5; i++ {
+		steps = append(steps, StepRecord{Type: "decide", Action: "tool", StepNumber: i})
+		steps = append(steps, StepRecord{Type: "tool", ToolName: "update_plan", StepNumber: i})
+	}
+
+	state := &AgentState{StepHistory: steps}
+	decision := Decision{Action: "tool", ToolName: "update_plan"}
+	prep := []DecidePrep{{}} // no loop detected (meta-tools excluded from LoopDetector)
+
+	action := node.Post(state, prep, decision)
+
+	if action != core.ActionAnswer {
+		t.Errorf("4 consecutive meta-tool calls should force answer, got action=%v", action)
+	}
+}
+
+func TestMetaToolGuard_SoftRedirectOnConsecutiveMetaTools(t *testing.T) {
+	node := NewDecideNode(&mockLLMProvider{}, nil)
+
+	// Build history with 2 consecutive update_plan tool steps (soft threshold = 2)
+	steps := []StepRecord{
+		{Type: "tool", ToolName: "file_read", StepNumber: 1},
+		{Type: "tool", ToolName: "update_plan", StepNumber: 2},
+		{Type: "tool", ToolName: "update_plan", StepNumber: 3},
+	}
+
+	state := &AgentState{StepHistory: steps}
+	decision := Decision{Action: "tool", ToolName: "update_plan"}
+	prep := []DecidePrep{{}}
+
+	action := node.Post(state, prep, decision)
+
+	// Should allow the tool call (not force answer)
+	if action != core.ActionTool {
+		t.Errorf("2 consecutive meta-tool calls should allow tool (soft redirect), got action=%v", action)
+	}
+	// Should set redirect message for next Prep
+	if state.MetaToolRedirectMsg == "" {
+		t.Error("expected MetaToolRedirectMsg to be set for soft redirect")
+	}
+	if !strings.Contains(state.MetaToolRedirectMsg, "file_read") {
+		t.Errorf("redirect should list actual tool names, got: %s", state.MetaToolRedirectMsg)
+	}
+}
+
+func TestMetaToolGuard_AllowsNormalMetaToolUsage(t *testing.T) {
+	node := NewDecideNode(&mockLLMProvider{}, nil)
+
+	// Normal pattern: update_plan, real_tool, update_plan (non-consecutive, count resets)
+	steps := []StepRecord{
+		{Type: "tool", ToolName: "update_plan", StepNumber: 1},
+		{Type: "tool", ToolName: "file_read", StepNumber: 2},
+		{Type: "tool", ToolName: "update_plan", StepNumber: 3},
+	}
+
+	state := &AgentState{StepHistory: steps}
+	decision := Decision{Action: "tool", ToolName: "update_plan"}
+	prep := []DecidePrep{{}}
+
+	action := node.Post(state, prep, decision)
+
+	if action != core.ActionTool {
+		t.Errorf("1 consecutive meta-tool call should be allowed, got action=%v", action)
+	}
+	// No redirect needed for single consecutive meta-tool
+	if state.MetaToolRedirectMsg != "" {
+		t.Errorf("should not set redirect for 1 consecutive meta-tool, got: %s", state.MetaToolRedirectMsg)
+	}
+	if state.SuppressMetaTools {
+		t.Error("should not suppress meta-tools for 1 consecutive call")
+	}
+}
+
+func TestMetaToolGuard_SuppressAndRestore(t *testing.T) {
+	node := NewDecideNode(&mockLLMProvider{}, nil)
+
+	// 2 consecutive meta-tools → suppress
+	steps := []StepRecord{
+		{Type: "tool", ToolName: "file_read", StepNumber: 1},
+		{Type: "tool", ToolName: "update_plan", StepNumber: 2},
+		{Type: "tool", ToolName: "update_plan", StepNumber: 3},
+	}
+	state := &AgentState{StepHistory: steps}
+	decision := Decision{Action: "tool", ToolName: "update_plan"}
+	prep := []DecidePrep{{}}
+
+	node.Post(state, prep, decision)
+	if !state.SuppressMetaTools {
+		t.Error("expected SuppressMetaTools=true after 2 consecutive meta-tool calls")
+	}
+
+	// Now LLM calls a real tool → restore
+	state.StepHistory = append(state.StepHistory, StepRecord{Type: "tool", ToolName: "update_plan", StepNumber: 4})
+	decision2 := Decision{Action: "tool", ToolName: "file_read"}
+	node.Post(state, prep, decision2)
+	if state.SuppressMetaTools {
+		t.Error("expected SuppressMetaTools=false after non-meta tool call")
+	}
+}
+
+func TestFilterOutMetaToolDefs(t *testing.T) {
+	defs := []llm.ToolDefinition{
+		{Name: "file_read"},
+		{Name: "update_plan"},
+		{Name: "shell_exec"},
+		{Name: "walkthrough"},
+		{Name: "file_write"},
+	}
+	filtered := filterOutMetaToolDefs(defs)
+	if len(filtered) != 3 {
+		t.Fatalf("expected 3 non-meta tools, got %d", len(filtered))
+	}
+	for _, d := range filtered {
+		if metaTools[d.Name] {
+			t.Errorf("meta-tool %s should have been filtered out", d.Name)
+		}
+	}
+}
+
+func TestLastToolStep(t *testing.T) {
+	t.Run("empty history", func(t *testing.T) {
+		if got := lastToolStep(nil); got != nil {
+			t.Errorf("expected nil for empty history, got %+v", got)
+		}
+	})
+
+	t.Run("only decide steps", func(t *testing.T) {
+		steps := []StepRecord{
+			{Type: "decide", StepNumber: 1},
+			{Type: "decide", StepNumber: 2},
+		}
+		if got := lastToolStep(steps); got != nil {
+			t.Errorf("expected nil when no tool steps, got %+v", got)
+		}
+	})
+
+	t.Run("returns last tool step", func(t *testing.T) {
+		steps := []StepRecord{
+			{Type: "tool", ToolName: "file_read", StepNumber: 1},
+			{Type: "decide", StepNumber: 2},
+			{Type: "tool", ToolName: "update_plan", StepNumber: 3, IsError: true},
+			{Type: "decide", StepNumber: 4},
+		}
+		got := lastToolStep(steps)
+		if got == nil || got.ToolName != "update_plan" || !got.IsError {
+			t.Errorf("expected last tool step to be update_plan with error, got %+v", got)
+		}
+	})
+}
+
+func TestMetaToolGuard_ProactiveSuppressOnError(t *testing.T) {
+	// When the last tool step is a meta-tool that returned an error,
+	// Prep should proactively set SuppressMetaTools = true.
+	reg := tool.NewRegistry()
+	reg.Register(&mockTool{"file_read", "Read files"})
+	reg.Register(&mockTool{"update_plan", "Update plan"})
+	reg.Register(&mockTool{"shell_exec", "Run commands"})
+
+	state := &AgentState{
+		ToolCallMode: "fc",
+		ToolRegistry: reg,
+		StepHistory: []StepRecord{
+			{Type: "tool", ToolName: "update_plan", StepNumber: 1, IsError: true},
+		},
+	}
+
+	node := NewDecideNode(&mockLLMProvider{}, nil)
+	preps := node.Prep(state)
+
+	if !state.SuppressMetaTools {
+		t.Fatal("expected SuppressMetaTools=true after meta-tool error")
+	}
+
+	// Verify meta-tools are filtered from tool definitions
+	for _, d := range preps[0].ToolDefinitions {
+		if metaTools[d.Name] {
+			t.Errorf("meta-tool %s should be filtered from ToolDefinitions", d.Name)
+		}
+	}
+}
+
+func TestMetaToolGuard_NoProactiveSuppressOnSuccess(t *testing.T) {
+	// When the last tool step is a meta-tool that succeeded,
+	// Prep should NOT proactively suppress.
+	reg := tool.NewRegistry()
+	reg.Register(&mockTool{"file_read", "Read files"})
+	reg.Register(&mockTool{"update_plan", "Update plan"})
+
+	state := &AgentState{
+		ToolCallMode: "fc",
+		ToolRegistry: reg,
+		StepHistory: []StepRecord{
+			{Type: "tool", ToolName: "update_plan", StepNumber: 1, IsError: false},
+		},
+	}
+
+	node := NewDecideNode(&mockLLMProvider{}, nil)
+	node.Prep(state)
+
+	if state.SuppressMetaTools {
+		t.Error("expected SuppressMetaTools=false when meta-tool succeeded")
+	}
+}
+
+func TestMetaToolGuard_NoProactiveSuppressOnNonMetaError(t *testing.T) {
+	// When the last tool step is a non-meta tool that returned an error,
+	// Prep should NOT proactively suppress meta-tools.
+	reg := tool.NewRegistry()
+	reg.Register(&mockTool{"file_read", "Read files"})
+	reg.Register(&mockTool{"update_plan", "Update plan"})
+
+	state := &AgentState{
+		ToolCallMode: "fc",
+		ToolRegistry: reg,
+		StepHistory: []StepRecord{
+			{Type: "tool", ToolName: "file_read", StepNumber: 1, IsError: true},
+		},
+	}
+
+	node := NewDecideNode(&mockLLMProvider{}, nil)
+	node.Prep(state)
+
+	if state.SuppressMetaTools {
+		t.Error("expected SuppressMetaTools=false when non-meta tool had error")
+	}
+}
+
+func TestGenerateToolsPromptExcluding(t *testing.T) {
+	reg := tool.NewRegistry()
+	reg.Register(&mockTool{"file_read", "Read files"})
+	reg.Register(&mockTool{"update_plan", "Update plan"})
+	reg.Register(&mockTool{"shell_exec", "Run commands"})
+	reg.Register(&mockTool{"walkthrough", "Walkthrough memo"})
+
+	prompt := generateToolsPromptExcluding(reg, metaTools)
+
+	if !strings.Contains(prompt, "file_read") {
+		t.Error("prompt should contain file_read")
+	}
+	if !strings.Contains(prompt, "shell_exec") {
+		t.Error("prompt should contain shell_exec")
+	}
+	if strings.Contains(prompt, "update_plan") {
+		t.Error("prompt should NOT contain update_plan")
+	}
+	if strings.Contains(prompt, "walkthrough") {
+		t.Error("prompt should NOT contain walkthrough")
+	}
+}
+
+// ── Plan Sideband Tests ──
+
+func TestParsePlanSideband_Valid(t *testing.T) {
+	tests := []struct {
+		reason     string
+		wantStep   string
+		wantStatus string
+	}{
+		{"创建 server.ts [plan:create_server:in_progress]", "create_server", "in_progress"},
+		{"安装依赖完成 [plan:install_deps:done]", "install_deps", "done"},
+		{"[plan:verify:done] 验证通过", "verify", "done"},
+		{"中间 [plan:step_3:in_progress] 文本", "step_3", "in_progress"},
+	}
+	for _, tt := range tests {
+		step, status := parsePlanSideband(tt.reason)
+		if step != tt.wantStep || status != tt.wantStatus {
+			t.Errorf("parsePlanSideband(%q) = (%q, %q), want (%q, %q)",
+				tt.reason, step, status, tt.wantStep, tt.wantStatus)
+		}
+	}
+}
+
+func TestParsePlanSideband_Invalid(t *testing.T) {
+	tests := []string{
+		"普通 reason 没有标记",
+		"[plan:create_server]",           // 缺少 status
+		"[plan:create_server:pending]",   // invalid status
+		"[plan::done]",                   // 缺少 step_id
+		"plan:create_server:in_progress", // 缺少方括号
+	}
+	for _, reason := range tests {
+		step, status := parsePlanSideband(reason)
+		if step != "" || status != "" {
+			t.Errorf("parsePlanSideband(%q) = (%q, %q), want empty", reason, step, status)
+		}
+	}
+}
+
+func TestPlanSideband_YAMLMode(t *testing.T) {
+	yamlText := `action: tool
+tool_name: file_write
+tool_params:
+  path: server.ts
+reason: 创建文件
+plan_step: create_server
+plan_status: in_progress`
+
+	decision, err := parseDecision(yamlText)
+	if err != nil {
+		t.Fatalf("parseDecision failed: %v", err)
+	}
+	if decision.PlanStep != "create_server" {
+		t.Errorf("PlanStep = %q, want %q", decision.PlanStep, "create_server")
+	}
+	if decision.PlanStatus != "in_progress" {
+		t.Errorf("PlanStatus = %q, want %q", decision.PlanStatus, "in_progress")
+	}
+}
+
+func TestPlanSideband_PostUpdatesPlanStore(t *testing.T) {
+	ps := plan.NewPlanStore()
+	sid := "test-session"
+	ps.Set(sid, []plan.PlanStep{
+		{ID: "create_server", Title: "创建服务器", Status: "pending"},
+		{ID: "install_deps", Title: "安装依赖", Status: "pending"},
+	})
+
+	node := &DecideNode{}
+	state := &AgentState{
+		PlanStore: ps,
+		PlanSID:   sid,
+	}
+
+	// YAML mode: PlanStep/PlanStatus directly on Decision
+	decision := Decision{
+		Action:     "tool",
+		ToolName:   "file_write",
+		Reason:     "创建文件",
+		PlanStep:   "create_server",
+		PlanStatus: "in_progress",
+	}
+
+	node.Post(state, nil, decision)
+
+	steps := ps.Get(sid)
+	if steps[0].Status != "in_progress" {
+		t.Errorf("step[0].Status = %q, want %q", steps[0].Status, "in_progress")
+	}
+
+	// FC mode: sideband in reason text
+	decision2 := Decision{
+		Action:   "tool",
+		ToolName: "shell_exec",
+		Reason:   "安装依赖 [plan:install_deps:done]",
+	}
+
+	node.Post(state, nil, decision2)
+
+	steps = ps.Get(sid)
+	if steps[1].Status != "done" {
+		t.Errorf("step[1].Status = %q, want %q", steps[1].Status, "done")
+	}
+}
+
+func TestPlanSideband_SSECallback(t *testing.T) {
+	ps := plan.NewPlanStore()
+	sid := "test-session"
+	ps.Set(sid, []plan.PlanStep{
+		{ID: "step_a", Title: "Step A", Status: "pending"},
+	})
+
+	var callbackSteps []plan.PlanStep
+	node := &DecideNode{}
+	state := &AgentState{
+		PlanStore: ps,
+		PlanSID:   sid,
+		OnPlanUpdate: func(steps []plan.PlanStep) {
+			callbackSteps = steps
+		},
+	}
+
+	decision := Decision{
+		Action:     "tool",
+		ToolName:   "file_write",
+		PlanStep:   "step_a",
+		PlanStatus: "done",
+	}
+
+	node.Post(state, nil, decision)
+
+	if callbackSteps == nil {
+		t.Fatal("OnPlanUpdate callback was not called")
+	}
+	if len(callbackSteps) != 1 || callbackSteps[0].Status != "done" {
+		t.Errorf("callback received wrong steps: %+v", callbackSteps)
 	}
 }

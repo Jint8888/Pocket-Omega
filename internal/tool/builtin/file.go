@@ -132,6 +132,11 @@ func (t *FileWriteTool) Execute(_ context.Context, args json.RawMessage) (tool.T
 		return tool.ToolResult{Error: err.Error()}, nil
 	}
 
+	// Protected file guard: block writes to mcp.json etc.
+	if msg := checkProtectedFile(path, t.workspaceDir); msg != "" {
+		return tool.ToolResult{Error: msg}, nil
+	}
+
 	// Create parent directories
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -384,7 +389,7 @@ func safeResolvePath(path, workspaceDir string) (string, error) {
 		// "C:\project" vs "C:\project-evil" → must compare "C:\project\"
 		if realResolved != realWorkspace &&
 			!strings.HasPrefix(realResolved, realWorkspace+string(os.PathSeparator)) {
-			return "", fmt.Errorf("安全限制: 路径 %q 超出工作目录 %q", path, workspaceDir)
+			return "", fmt.Errorf("安全限制: 路径 %q 超出工作目录 %q。文件工具只能操作工作目录内的文件，请改用 shell_exec 访问外部路径", path, workspaceDir)
 		}
 	}
 
@@ -404,4 +409,37 @@ func resolveExisting(path string) (string, error) {
 		return filepath.Join(real, filepath.Base(path)), nil
 	}
 	return path, nil
+}
+
+// protectedFiles maps workspace-relative filenames to the tool that should be
+// used instead. Writes to these files via file_write/file_patch/file_delete are
+// blocked at the code level to prevent accidental corruption by the agent.
+var protectedFiles = map[string]string{
+	"mcp.json": "mcp_server_add/mcp_server_remove",
+}
+
+// checkProtectedFile returns a non-empty error message if resolvedPath points
+// to a protected file that must not be modified by generic file tools.
+func checkProtectedFile(resolvedPath, workspaceDir string) string {
+	if workspaceDir == "" {
+		return ""
+	}
+	base := filepath.Base(resolvedPath)
+	dir := filepath.Dir(resolvedPath)
+	absWorkspace, _ := filepath.Abs(workspaceDir)
+
+	// Normalise for Windows case-insensitive comparison.
+	if runtime.GOOS == "windows" {
+		dir = strings.ToLower(dir)
+		absWorkspace = strings.ToLower(absWorkspace)
+		base = strings.ToLower(base)
+	}
+
+	if dir != absWorkspace {
+		return "" // only protect files at workspace root
+	}
+	if alt, ok := protectedFiles[base]; ok {
+		return fmt.Sprintf("禁止直接修改 %s — 请使用 %s 工具操作。直接编辑会破坏文件格式并导致配置丢失", base, alt)
+	}
+	return ""
 }

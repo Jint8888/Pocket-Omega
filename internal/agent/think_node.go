@@ -81,7 +81,7 @@ func buildThinkContext(state *AgentState) string {
 	for _, s := range state.StepHistory {
 		switch s.Type {
 		case "tool":
-			sb.WriteString(fmt.Sprintf("[工具 %s 结果]: %s\n", s.ToolName, truncate(s.Output, perStepOutputBudget(state.ContextWindowTokens))))
+			sb.WriteString(fmt.Sprintf("[工具 %s 结果]: %s\n", s.ToolName, truncate(s.Output, perStepOutputBudget(state.ContextWindowTokens, recentWindowSize))))
 		case "think":
 			sb.WriteString(fmt.Sprintf("[推理]: %s\n", s.Output))
 		case "decide":

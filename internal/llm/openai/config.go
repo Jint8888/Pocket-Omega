@@ -22,6 +22,10 @@ type Config struct {
 	ToolCallMode    string   // "auto", "fc", or "yaml" (default: "auto")
 	ContextWindow   int      // context window in tokens (0 = auto-detect from model name)
 	ReasoningEffort string   // "low", "medium", or "high" (default: "medium"); only used in native thinking mode
+
+	// Cached resolved values — populated once by Resolve() to avoid repeated detection + log noise.
+	resolvedThinkingMode string
+	resolvedToolCallMode string
 }
 
 // NewConfigFromEnv creates Config from environment variables.
@@ -75,33 +79,47 @@ func (c *Config) Validate() error {
 
 // ResolveThinkingMode returns the effective thinking mode.
 // When set to "auto", it detects based on the model name.
+// Result is cached after first call to avoid repeated detection and log noise.
 func (c *Config) ResolveThinkingMode() string {
+	if c.resolvedThinkingMode != "" {
+		return c.resolvedThinkingMode
+	}
 	if c.ThinkingMode == "native" || c.ThinkingMode == "app" {
-		return c.ThinkingMode
+		c.resolvedThinkingMode = c.ThinkingMode
+		return c.resolvedThinkingMode
 	}
 	// auto: detect from model name
 	cap := llm.DetectThinkingCapability(c.Model)
 	if cap.SupportsNativeThinking {
 		log.Printf("[Config] Auto-detected native thinking for model %q", c.Model)
-		return "native"
+		c.resolvedThinkingMode = "native"
+	} else {
+		log.Printf("[Config] Model %q does not support native thinking, using app mode", c.Model)
+		c.resolvedThinkingMode = "app"
 	}
-	log.Printf("[Config] Model %q does not support native thinking, using app mode", c.Model)
-	return "app"
+	return c.resolvedThinkingMode
 }
 
 // ResolveToolCallMode returns the effective tool call mode.
 // When set to "auto", it detects based on the model name.
+// Result is cached after first call to avoid repeated detection and log noise.
 func (c *Config) ResolveToolCallMode() string {
+	if c.resolvedToolCallMode != "" {
+		return c.resolvedToolCallMode
+	}
 	if c.ToolCallMode == "fc" || c.ToolCallMode == "yaml" {
-		return c.ToolCallMode
+		c.resolvedToolCallMode = c.ToolCallMode
+		return c.resolvedToolCallMode
 	}
 	// auto: detect from model name
 	if llm.DetectToolCallingCapability(c.Model) {
 		log.Printf("[Config] Auto-detected FC support for model %q", c.Model)
-		return "fc"
+		c.resolvedToolCallMode = "fc"
+	} else {
+		log.Printf("[Config] Model %q does not support FC, using yaml mode", c.Model)
+		c.resolvedToolCallMode = "yaml"
 	}
-	log.Printf("[Config] Model %q does not support FC, using yaml mode", c.Model)
-	return "yaml"
+	return c.resolvedToolCallMode
 }
 
 // ResolveContextWindow returns the effective context window in tokens.

@@ -22,6 +22,10 @@ func TestDetectThinkingCapability(t *testing.T) {
 		{"GLM-5 direct", "glm-5", true},
 		{"GLM-5 via SiliconFlow", "Pro/zai-org/GLM-5", true},
 
+		// Gemini 3.1 (Google thinking models)
+		{"Gemini 3.1 Pro High", "gemini-3.1-pro-high", true},
+		{"Gemini 3.1 Flash", "gemini-3.1-flash", true},
+
 		// Keyword matches
 		{"Custom reasoner model", "my-custom-reasoner-v2", true},
 		{"Thinking model", "model-thinking-v1", true},

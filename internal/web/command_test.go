@@ -61,7 +61,7 @@ func TestHandleCommand_Reload_OK(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	var result CommandResult
+	var result commandResult
 	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestHandleCommand_Clear_DeletesSession(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	var result CommandResult
+	var result commandResult
 	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestHandleCommand_Clear_DeletesSession(t *testing.T) {
 func TestHandleCommand_Help(t *testing.T) {
 	h := newTestCommandHandler(t)
 	w := doCommand(t, h, http.MethodPost, commandRequest{Command: "help"})
-	var result CommandResult
+	var result commandResult
 	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestHandleCommand_Unknown(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	var result CommandResult
+	var result commandResult
 	if err := json.NewDecoder(w.Body).Decode(&result); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}

@@ -6,17 +6,12 @@ import (
 	"fmt"
 	"log"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/pocketomega/pocket-omega/internal/core"
 	"github.com/pocketomega/pocket-omega/internal/llm"
 	"github.com/pocketomega/pocket-omega/internal/prompt"
-	"github.com/pocketomega/pocket-omega/internal/thinking"
-	"github.com/pocketomega/pocket-omega/internal/tool"
-	"github.com/pocketomega/pocket-omega/internal/util"
-	"gopkg.in/yaml.v3"
 )
 
 // DecideNode implements BaseNode[AgentState, DecidePrep, Decision].
@@ -51,6 +46,28 @@ func (n *DecideNode) Prep(state *AgentState) []DecidePrep {
 	toolingSummary := buildToolingSection(state.ToolRegistry)
 	runtimeLine := buildRuntimeLine(state)
 
+	// Proactive meta-tool suppression: if the last tool step was a meta-tool
+	// that returned an error (e.g., dedup), suppress meta-tools immediately
+	// so the LLM cannot repeat the same mistake on the very next round.
+	// This eliminates the 1-step delay of the Post-based MetaToolGuard.
+	if !state.SuppressMetaTools {
+		if last := lastToolStep(state.StepHistory); last != nil {
+			if metaTools[last.ToolName] && last.IsError {
+				state.SuppressMetaTools = true
+				log.Printf("[MetaToolGuard] Proactive suppress: last meta-tool %s returned error", last.ToolName)
+			}
+		}
+	}
+
+	// SuppressMetaTools: when the LLM is stuck calling meta-tools repeatedly,
+	// physically remove them from the tool list so the LLM cannot select them.
+	// This is the nuclear option — prompt-level interventions failed for weaker models.
+	if state.SuppressMetaTools {
+		toolDefs = filterOutMetaToolDefs(toolDefs)
+		toolsPrompt = generateToolsPromptExcluding(state.ToolRegistry, metaTools)
+		log.Printf("[MetaToolGuard] Meta-tools suppressed from tool list for this round")
+	}
+
 	// Phase 2: detect MCP intent for conditional guide loading
 	hasMCPIntent := containsMCPKeywords(state.Problem)
 
@@ -76,7 +93,26 @@ func (n *DecideNode) Prep(state *AgentState) []DecidePrep {
 		HasMCPIntent:        hasMCPIntent,
 		ContextWindowTokens: state.ContextWindowTokens,
 		LoopDetected:        (&LoopDetector{}).Check(state.StepHistory),
+		ExplorationDetected: (&ExplorationDetector{}).Check(state.StepHistory, MaxAgentSteps),
 		CostGuard:           state.CostGuard, // pointer shared for Exec to record tokens
+	}
+
+	// Read walkthrough memo for prompt injection
+	if state.WalkthroughStore != nil && state.WalkthroughSID != "" {
+		prep.WalkthroughText = state.WalkthroughStore.Render(state.WalkthroughSID)
+	}
+
+	// Read plan status for prompt injection
+	if state.PlanStore != nil && state.PlanSID != "" {
+		prep.PlanText = state.PlanStore.Render(state.PlanSID)
+	}
+
+	// MetaToolGuard redirect: consume the redirect message set by Post and
+	// append it to PlanText so the LLM sees it alongside the plan status.
+	// This is a one-shot injection — consumed immediately after reading.
+	if state.MetaToolRedirectMsg != "" {
+		prep.PlanText += "\n" + state.MetaToolRedirectMsg + "\n"
+		state.MetaToolRedirectMsg = ""
 	}
 
 	// Estimate system prompt size for CostGuard + ContextGuard accuracy.
@@ -156,7 +192,7 @@ func (n *DecideNode) Exec(ctx context.Context, prep DecidePrep) (Decision, error
 		// Include SystemPromptEst to avoid underestimating by ~20-25%
 		contentTokens := prep.SystemPromptEst +
 			estimateTokens(prep.StepSummary+prep.ToolsPrompt+prep.ConversationHistory+
-				prep.Problem+prep.ToolingSummary)
+				prep.Problem+prep.ToolingSummary+prep.WalkthroughText+prep.PlanText)
 		switch guard.CheckTokens(contentTokens) {
 		case ContextWarning:
 			log.Printf("[ContextGuard] Context at ~70%%, consider /compact")
@@ -308,6 +344,23 @@ func (n *DecideNode) Post(state *AgentState, prep []DecidePrep, results ...Decis
 
 	log.Printf("[Decide] Step %d: action=%s reason=%s", step.StepNumber, decision.Action, decision.Reason)
 
+	// Plan sideband: extract plan status update piggybacked on Decision.
+	// YAML mode: PlanStep/PlanStatus are auto-parsed from yaml tags.
+	// FC mode: parse [plan:step_id:status] marker from reason text.
+	if state.PlanStore != nil && state.PlanSID != "" {
+		planStep, planStatus := decision.PlanStep, decision.PlanStatus
+		if planStep == "" && decision.Reason != "" {
+			planStep, planStatus = parsePlanSideband(decision.Reason)
+		}
+		if planStep != "" && planStatus != "" {
+			state.PlanStore.Update(state.PlanSID, planStep, planStatus, "")
+			log.Printf("[PlanSideband] %s → %s", planStep, planStatus)
+			if state.OnPlanUpdate != nil {
+				state.OnPlanUpdate(state.PlanStore.Get(state.PlanSID))
+			}
+		}
+	}
+
 	// Force termination if too many steps
 	if len(state.StepHistory) >= MaxAgentSteps {
 		log.Printf("[Decide] Max steps reached (%d), forcing answer", MaxAgentSteps)
@@ -336,16 +389,51 @@ func (n *DecideNode) Post(state *AgentState, prep []DecidePrep, results ...Decis
 
 	switch decision.Action {
 	case "tool":
-		// LoopDetector: soft intervention first, hard override on streak ≥ 2
-		if len(prep) > 0 && prep[0].LoopDetected.Detected {
-			state.LoopDetectionStreak++
-			if state.LoopDetectionStreak >= 2 {
-				log.Printf("[LoopDetector] Hard override (streak=%d): tool → answer (%s)",
-					state.LoopDetectionStreak, prep[0].LoopDetected.Rule)
+		// Meta-tool consecutive guard: three-tier intervention.
+		// Tier 1 (soft, ≥2): inject redirect message + suppress meta-tools from next tool list.
+		// Tier 2 (hard, ≥4): force answer to prevent infinite loop.
+		// Non-meta-tool call: clear suppression (LLM broke out of the loop).
+		if metaTools[decision.ToolName] {
+			consecMeta := countTrailingMetaTools(state.StepHistory)
+			if consecMeta >= 4 {
+				log.Printf("[MetaToolGuard] Hard limit: %d consecutive meta-tool calls (%s), forcing answer",
+					consecMeta, decision.ToolName)
 				return core.ActionAnswer
 			}
-			// First detection: warning already injected in Prep, let LLM self-correct
-			log.Printf("[LoopDetector] Soft warning (streak=1), allowing tool call")
+			if consecMeta >= 2 {
+				log.Printf("[MetaToolGuard] Soft redirect + suppress: %d consecutive meta-tool calls (%s)",
+					consecMeta, decision.ToolName)
+				state.SuppressMetaTools = true
+				state.MetaToolRedirectMsg = "[SYSTEM] ⚠️ 你已连续多次调用 update_plan，但 update_plan 只是状态标记工具，不会执行任何实际操作。" +
+					"请立即调用实际工具来执行当前步骤，例如: file_read, file_write, file_list, shell_exec, web_search, mcp_server_add。"
+			}
+		} else {
+			// Non-meta-tool: LLM broke out of the loop, restore meta-tools
+			if state.SuppressMetaTools {
+				log.Printf("[MetaToolGuard] LLM called non-meta tool %s, restoring meta-tools", decision.ToolName)
+				state.SuppressMetaTools = false
+			}
+		}
+
+		// LoopDetector: soft intervention first, hard override on streak ≥ 2
+		if len(prep) > 0 && prep[0].LoopDetected.Detected {
+			// Self-correction check: if LLM switched to a different tool than
+			// the one that triggered the loop, treat it as self-corrected.
+			loopTool := prep[0].LoopDetected.ToolName
+			if loopTool != "" && decision.ToolName != loopTool {
+				log.Printf("[LoopDetector] Self-corrected: %s → %s, resetting streak",
+					loopTool, decision.ToolName)
+				state.LoopDetectionStreak = 0
+			} else {
+				state.LoopDetectionStreak++
+				if state.LoopDetectionStreak >= 2 {
+					log.Printf("[LoopDetector] Hard override (streak=%d): tool → answer (%s)",
+						state.LoopDetectionStreak, prep[0].LoopDetected.Rule)
+					return core.ActionAnswer
+				}
+				// First detection: warning already injected in Prep, let LLM self-correct
+				log.Printf("[LoopDetector] Soft warning (streak=1), allowing tool call")
+			}
 		} else {
 			state.LoopDetectionStreak = 0 // reset on clean step
 		}
@@ -376,610 +464,17 @@ func (n *DecideNode) ExecFallback(err error) Decision {
 	}
 }
 
-// ── Prompt construction ──
+// ── Plan sideband ──
 
-// buildSystemPrompt assembles the three-layer system prompt:
-//   - L1: hardcoded tool-call protocol and constraints (varies by mode)
-//   - L2: project behaviour rules from prompts/*.md (decision principles, answer style)
-//   - L3: user custom rules from rules.md (language, domain, style preferences)
-//
-// mode is one of "fc", "native", or anything else (app mode).
-func (n *DecideNode) buildSystemPrompt(mode string, prep DecidePrep) string {
-	var sb strings.Builder
+// planSidebandRe matches [plan:step_id:status] markers in FC mode reason text.
+var planSidebandRe = regexp.MustCompile(`\[plan:(\w+):(in_progress|done)\]`)
 
-	// #1 Soul: agent identity (loaded first to establish character)
-	if n.loader != nil {
-		if persona := n.loader.LoadSoul(); persona != "" {
-			sb.WriteString(persona)
-			sb.WriteString("\n\n")
-		}
+// parsePlanSideband extracts plan step and status from a reason string.
+// Returns ("", "") if no sideband marker is found.
+func parsePlanSideband(reason string) (step, status string) {
+	m := planSidebandRe.FindStringSubmatch(reason)
+	if len(m) == 3 {
+		return m[1], m[2]
 	}
-
-	// #2 User Rules: placed early for high LLM attention (above L1 protocol)
-	if n.loader != nil {
-		if rules := n.loader.LoadUserRules(); rules != "" {
-			sb.WriteString("## 用户自定义规则\n")
-			sb.WriteString(rules)
-			sb.WriteString("\n\n")
-		}
-	}
-
-	// #3 L1: hardcoded tool-call protocol (cannot be overridden)
-	sb.WriteString(decideL1Constraint(mode))
-
-	// #4 Runtime Info: compact single line (Phase 1)
-	if prep.RuntimeLine != "" {
-		sb.WriteString("\n\n")
-		sb.WriteString(prep.RuntimeLine)
-	}
-
-	// #5 Tooling Section: auto-generated tool summary (Phase 1)
-	if prep.ToolingSummary != "" {
-		sb.WriteString("\n\n")
-		sb.WriteString(prep.ToolingSummary)
-	}
-
-	// #6 Knowledge Dictionary + L2 behaviour rules
-	if n.loader != nil {
-		if knowledge := n.loader.Load("knowledge.md"); knowledge != "" {
-			sb.WriteString("\n\n")
-			sb.WriteString(knowledge)
-		}
-	}
-
-	// #7 Behavior Components
-	if n.loader != nil {
-		if common := n.loader.Load("decide_common.md"); common != "" {
-			sb.WriteString("\n\n")
-			sb.WriteString(common)
-		}
-		if style := n.loader.Load("answer_style.md"); style != "" {
-			sb.WriteString("\n\n")
-			sb.WriteString(style)
-		}
-		if ruleGuide := n.loader.Load("rule_guide.md"); ruleGuide != "" {
-			sb.WriteString("\n\n")
-			sb.WriteString(ruleGuide)
-		}
-		// think_guide.md — guides DecideNode on when to choose "think" action
-		if thinkGuide := n.loader.Load("think_guide.md"); thinkGuide != "" {
-			sb.WriteString("\n\n")
-			sb.WriteString(thinkGuide)
-		}
-		// Phase 2: MCP/skill creation guides — conditionally loaded based on Intent detection.
-		// Only loaded when user's Problem mentions MCP/skill/custom-tool keywords.
-		if prep.HasMCPIntent {
-			if mcpGuide := n.loader.Load("mcp_server_guide.md"); mcpGuide != "" {
-				sb.WriteString("\n\n")
-				sb.WriteString(mcpGuide)
-			}
-			if skillDocGuide := n.loader.Load("skill_doc_guide.md"); skillDocGuide != "" {
-				sb.WriteString("\n\n")
-				sb.WriteString(skillDocGuide)
-			}
-		}
-	}
-
-	result := sb.String()
-
-	// Phase 2: Token Budget Guard — temporary character truncation.
-	// If context window is known, cap system prompt at 25% of total token budget.
-	// This is a safety net; Phase 3 will replace with component-level removal.
-	//
-	// Rune-safe: use []rune slicing to avoid cutting in the middle of a
-	// multi-byte UTF-8 character (e.g. Chinese text is 3 bytes/char).
-	if prep.ContextWindowTokens > 0 {
-		maxChars := prep.ContextWindowTokens * charsPerToken * 25 / 100
-		runes := []rune(result)
-		if len(runes) > maxChars {
-			log.Printf("[Decide] Token budget guard: system prompt %d chars exceeds %d limit, truncating", len(runes), maxChars)
-			result = string(runes[:maxChars])
-		}
-	}
-
-	return result
-}
-
-// decideL1Constraint returns the hardcoded L1 system prompt fragment for DecideNode.
-// These constraints define the tool-call protocol and cannot be overridden by L2/L3.
-func decideL1Constraint(mode string) string {
-	switch mode {
-	case "fc":
-		return decideL1FC
-	case "native":
-		return decideL1Native
-	default: // "app" mode (extended thinking)
-		return decideL1App
-	}
-}
-
-// L1 constraints — hardcoded, not file-overridable.
-// Only the tool-call protocol and action set differ between modes;
-// decision strategy and answer format are intentionally kept in L2 files.
-
-const decideL1Native = `你是一个智能助手，根据用户问题和当前上下文，决定下一步行动。
-
-你可以选择两种行动：
-1. tool — 调用工具获取信息或执行操作
-2. answer — 直接回答用户问题
-
-## 核心行为准则
-- **禁止重复**：已完成步骤中出现过的相同工具+参数调用不再执行
-- **先规划**：多步任务在首次回复中简述执行计划
-- **及时结束**：任务完成后立即文本回复，不做多余验证
-- **合并操作**：shell 命令可组合时优先组合执行`
-
-const decideL1App = `你是一个智能助手，根据用户问题和当前上下文，决定下一步行动。
-
-你可以选择三种行动：
-1. tool — 调用工具获取信息或执行操作
-2. think — 进行深度推理分析
-3. answer — 直接回答用户问题
-
-## 核心行为准则
-- **禁止重复**：已完成步骤中出现过的相同工具+参数调用不再执行
-- **先规划**：多步任务在首次回复中简述执行计划
-- **及时结束**：任务完成后立即文本回复，不做多余验证
-- **合并操作**：shell 命令可组合时优先组合执行`
-
-const decideL1FC = `你是一个智能助手，根据用户问题和当前上下文，决定下一步行动。
-
-你有两种选择：
-1. 调用工具 — 通过 function calling 调用合适的工具
-2. 直接回答 — 如果已有足够信息或问题简单，直接用文本回复
-
-## 核心行为准则
-- **禁止重复**：已完成步骤中出现过的相同工具+参数调用不再执行
-- **先规划**：多步任务在首次回复中简述执行计划
-- **及时结束**：任务完成后立即文本回复，不做多余验证
-- **合并操作**：shell 命令可组合时优先组合执行`
-
-// buildDecidePromptFC builds the user prompt for FC mode (no YAML template).
-func buildDecidePromptFC(prep DecidePrep) string {
-	var sb strings.Builder
-
-	if prep.ConversationHistory != "" {
-		sb.WriteString(prep.ConversationHistory)
-		sb.WriteString("\n[当前问题]\n")
-	}
-	sb.WriteString(fmt.Sprintf("用户问题：%s\n\n", prep.Problem))
-	if prep.WorkspaceDir != "" {
-		sb.WriteString(fmt.Sprintf("当前工作目录：%s\n文件工具的路径相对于此目录。用 \".\" 表示当前目录。\n\n", prep.WorkspaceDir))
-	}
-
-	if prep.StepSummary != "" {
-		sb.WriteString(fmt.Sprintf("已完成步骤：\n%s\n\n", prep.StepSummary))
-	}
-
-	// When task is long, remind LLM of available tool names
-	if prep.StepCount > 3 && len(prep.ToolDefinitions) > 0 {
-		sb.WriteString("可用工具：")
-		for i, td := range prep.ToolDefinitions {
-			if i > 0 {
-				sb.WriteString(", ")
-			}
-			sb.WriteString(td.Name)
-		}
-		sb.WriteString("\n\n")
-	}
-
-	// Add urgency when step budget is running low
-	remaining := MaxAgentSteps - prep.StepCount
-	if remaining <= 3 && prep.StepCount > 0 {
-		sb.WriteString(fmt.Sprintf("⚠️ 剩余步骤预算：%d。请尽快用已有信息给出回答。\n\n", remaining))
-	}
-
-	sb.WriteString("请通过工具调用或直接文本回复来响应。")
-
-	// LoopDetector: inject warning into FC prompt
-	if prep.LoopDetected.Detected {
-		sb.WriteString(fmt.Sprintf(
-			"\n\n⚠️ 检测到重复操作模式（%s）。请直接用文本回复，不要调用工具。\n",
-			prep.LoopDetected.Description,
-		))
-	}
-
-	return sb.String()
-}
-
-func buildDecidePrompt(prep DecidePrep) string {
-	var sb strings.Builder
-
-	if prep.ConversationHistory != "" {
-		sb.WriteString(prep.ConversationHistory)
-		sb.WriteString("\n[当前问题]\n")
-	}
-	sb.WriteString(fmt.Sprintf("用户问题：%s\n\n", prep.Problem))
-	if prep.WorkspaceDir != "" {
-		sb.WriteString(fmt.Sprintf("当前工作目录：%s\n文件工具的路径相对于此目录。用 \".\" 表示当前目录。\n\n", prep.WorkspaceDir))
-	}
-	sb.WriteString(prep.ToolsPrompt)
-	sb.WriteString("\n")
-
-	if prep.StepSummary != "" {
-		sb.WriteString(fmt.Sprintf("已完成步骤：\n%s\n\n", prep.StepSummary))
-	}
-
-	// Add urgency when step budget is running low
-	remaining := MaxAgentSteps - prep.StepCount
-	if remaining <= 3 && prep.StepCount > 0 {
-		sb.WriteString(fmt.Sprintf("⚠️ 剩余步骤预算：%d。请尽快用已有信息给出 answer。\n\n", remaining))
-	}
-
-	// LoopDetector: inject warning into YAML prompt
-	if prep.LoopDetected.Detected {
-		sb.WriteString(fmt.Sprintf(
-			"⚠️ 检测到重复操作模式（%s）。请立即用已有信息给出 answer，不要再调用工具。\n\n",
-			prep.LoopDetected.Description,
-		))
-	}
-
-	// Dynamic YAML template based on thinking mode
-	if prep.ThinkingMode == "native" {
-		sb.WriteString(`请以 YAML 格式回复你的决策：
-` + "```yaml" + `
-action: "tool"  # 或 "answer"
-reason: "本步具体做什么（不要重复之前说过的话）"
-tool_name: "工具名"       # action=tool 时必需
-tool_params:              # action=tool 时必需
-  param1: "value1"
-answer: |                 # action=answer 时
-  最终回答...
-` + "```")
-	} else {
-		sb.WriteString(`请以 YAML 格式回复你的决策：
-` + "```yaml" + `
-action: "tool"  # 或 "think" 或 "answer"
-reason: "本步具体做什么（不要重复之前说过的话）"
-tool_name: "工具名"       # action=tool 时必需
-tool_params:              # action=tool 时必需
-  param1: "value1"
-thinking: |               # action=think 时
-  推理内容...
-answer: |                 # action=answer 时
-  最终回答...
-` + "```")
-	}
-
-	return sb.String()
-}
-
-// recentWindowSize is the number of recent tool steps to keep with full output.
-// Older tool steps are compressed to a one-line metadata summary.
-const recentWindowSize = 3
-
-// charsPerToken is the approximate character-to-token ratio for mixed Chinese/English.
-// Chinese text averages ~1.5 chars/token; ASCII text averages ~4 chars/token.
-// 2 is a conservative middle ground that avoids underestimating token cost.
-const charsPerToken = 2
-
-// perStepOutputBudget computes the max characters per recent tool step in the decision
-// prompt. Allocates toolOutputBudgetPct% of the context window to tool outputs and
-// divides evenly across recentWindowSize steps.
-// Falls back to 8000 when contextWindowTokens is 0 (unconfigured), preserving
-// existing behaviour.
-func perStepOutputBudget(contextWindowTokens int) int {
-	if contextWindowTokens <= 0 {
-		return 8000 // backward-compatible default
-	}
-	const toolOutputBudgetPct = 40 // percent of context window reserved for tool outputs
-	budget := contextWindowTokens * charsPerToken * toolOutputBudgetPct / 100 / recentWindowSize
-	if budget < 1000 {
-		budget = 1000 // floor: keep outputs useful even on tiny context windows
-	}
-	return budget
-}
-
-func buildStepSummary(steps []StepRecord, contextWindowTokens int) string {
-	if len(steps) == 0 {
-		return ""
-	}
-
-	// Count tool steps to determine the sliding window boundary
-	toolCount := 0
-	for _, s := range steps {
-		if s.Type == "tool" {
-			toolCount++
-		}
-	}
-	// Tool steps with index >= this threshold get full output
-	fullOutputThreshold := toolCount - recentWindowSize
-
-	// Duplicate detection: track first occurrence of each tool+param combination
-	type toolCallKey struct {
-		name  string
-		param string // key parameter value (e.g. path for file tools, command for shell)
-	}
-	seen := make(map[toolCallKey]int) // key → first step number
-
-	var sb strings.Builder
-	toolIdx := 0
-	for _, s := range steps {
-		switch s.Type {
-		case "decide":
-			sb.WriteString(fmt.Sprintf("  步骤 %d [决策]: %s → %s\n", s.StepNumber, s.Action, s.Input))
-		case "tool":
-			// Only perform dedup for tools with a registered key parameter.
-			// Tools not in paramDedupTools (e.g. search_tavily, http_request, web_reader)
-			// may legitimately be called multiple times with different parameters —
-			// skip dedup tracking for them to avoid false-positive warnings.
-			dupWarning := ""
-			if paramName, ok := paramDedupTools[s.ToolName]; ok {
-				key := toolCallKey{
-					name:  s.ToolName,
-					param: extractParam(s.Input, paramName),
-				}
-				if firstStep, exists := seen[key]; exists {
-					dupWarning = fmt.Sprintf(" ⚠️[与步骤%d重复，可复用其结果]", firstStep)
-				} else {
-					seen[key] = s.StepNumber
-				}
-			}
-
-			if toolIdx >= fullOutputThreshold {
-				// Recent tool step — keep full output within model-aware budget
-				sb.WriteString(fmt.Sprintf("  步骤 %d [工具 %s]: %s%s\n", s.StepNumber, s.ToolName, truncate(s.Output, perStepOutputBudget(contextWindowTokens)), dupWarning))
-			} else {
-				// Old tool step — one-line summary
-				sb.WriteString(fmt.Sprintf("  步骤 %d [工具 %s]: 已执行 (%s)，输出 %d bytes%s\n", s.StepNumber, s.ToolName, truncate(s.Input, 80), len(s.Output), dupWarning))
-			}
-			toolIdx++
-		case "think":
-			sb.WriteString(fmt.Sprintf("  步骤 %d [推理]: %s\n", s.StepNumber, truncate(s.Output, 200)))
-		case "answer":
-			sb.WriteString(fmt.Sprintf("  步骤 %d [回答]: %s\n", s.StepNumber, truncate(s.Output, 200)))
-		}
-	}
-	return sb.String()
-}
-
-func parseDecision(raw string) (Decision, error) {
-	yamlStr, err := thinking.ExtractYAML(raw)
-	if err != nil {
-		yamlStr = raw
-	}
-
-	var decision Decision
-	if err := yaml.Unmarshal([]byte(yamlStr), &decision); err != nil {
-		// Retry with backslash fix: LLMs often produce Windows paths like
-		// path: "E:\AI\Pocket-Omega\docs" which breaks YAML double-quoted
-		// string escaping. Replace backslashes with forward slashes in
-		// double-quoted values as a recovery strategy.
-		fixed := fixBackslashes(yamlStr)
-		if err2 := yaml.Unmarshal([]byte(fixed), &decision); err2 != nil {
-			return Decision{}, fmt.Errorf("YAML parse error: %w", err)
-		}
-		log.Printf("[Decide] Recovered from YAML backslash issue")
-	}
-
-	if decision.Action == "" {
-		return Decision{}, fmt.Errorf("decision missing 'action' field")
-	}
-
-	return decision, nil
-}
-
-// fixBackslashes replaces Windows-path backslashes with forward slashes inside
-// double-quoted YAML values to fix Windows path escape issues.
-//
-// Strategy: Use regex to find Windows drive-path patterns (e.g. "E:\AI\docs")
-// inside double-quoted strings and replace their backslashes with forward slashes.
-// This avoids the character-by-character ambiguity where \f could be a YAML
-// escape (form-feed) or a path segment (\foo).
-var windowsPathInQuotes = regexp.MustCompile(`"([A-Za-z]:\\[^"]*)"`)
-
-func fixBackslashes(s string) string {
-	return windowsPathInQuotes.ReplaceAllStringFunc(s, func(match string) string {
-		// match includes surrounding quotes: "E:\AI\docs"
-		// Replace all backslashes between the quotes with forward slashes
-		inner := match[1 : len(match)-1] // strip quotes
-		inner = strings.ReplaceAll(inner, `\`, `/`)
-		return `"` + inner + `"`
-	})
-}
-
-func truncate(s string, maxLen int) string { return util.TruncateRunes(s, maxLen) }
-
-// parseNativeFCContent extracts a tool call from models (e.g. Kimi-K2.5) that
-// embed FC intent in the Content field using special tokens rather than the
-// standard tool_calls field.
-//
-// Expected format in Content:
-//
-//	<|tool_calls_section_begin|>[{"name":"tool","parameters":{...}}]<|tool_call_end|>
-//
-// The function also tolerates "arguments" as an alias for "parameters" to handle
-// minor format variations across model versions.
-//
-// Returns the parsed Decision and true on success; zero-value Decision and false
-// when the format doesn't match, JSON is malformed, or the tool name is unknown.
-func parseNativeFCContent(content string, toolDefs []llm.ToolDefinition) (Decision, bool) {
-	const startMark = "<|tool_calls_section_begin|>"
-	const endMark = "<|tool_call_end|>"
-
-	startIdx := strings.Index(content, startMark)
-	endIdx := strings.Index(content, endMark)
-	if startIdx < 0 || endIdx <= startIdx {
-		return Decision{}, false
-	}
-
-	jsonStr := strings.TrimSpace(content[startIdx+len(startMark) : endIdx])
-
-	// Kimi format: array of objects with "name" and "parameters" (or "arguments")
-	var calls []struct {
-		Name       string         `json:"name"`
-		Parameters map[string]any `json:"parameters"`
-		Arguments  map[string]any `json:"arguments"` // fallback alias
-	}
-	if err := json.Unmarshal([]byte(jsonStr), &calls); err != nil || len(calls) == 0 {
-		log.Printf("[Decide] Native FC tokens: JSON parse failed (json=%s): %v", truncate(jsonStr, 120), err)
-		return Decision{}, false
-	}
-
-	tc := calls[0]
-	params := tc.Parameters
-	if params == nil {
-		params = tc.Arguments
-	}
-	if params == nil {
-		params = make(map[string]any)
-	}
-
-	// Validate tool name against registered definitions
-	if len(toolDefs) > 0 {
-		found := false
-		for _, td := range toolDefs {
-			if td.Name == tc.Name {
-				found = true
-				break
-			}
-		}
-		if !found {
-			log.Printf("[Decide] Native FC tokens: unknown tool %q", tc.Name)
-			return Decision{}, false
-		}
-	}
-
-	// Extract reasoning text before FC tokens (content before <|tool_calls_section_begin|>)
-	reason := strings.TrimSpace(content[:startIdx])
-	if reason == "" {
-		reason = fmt.Sprintf("native FC: call %s", tc.Name)
-	} else {
-		reason = truncate(reason, 200)
-	}
-
-	return Decision{
-		Action:     "tool",
-		Reason:     reason,
-		ToolName:   tc.Name,
-		ToolParams: params,
-	}, true
-}
-
-// ── Phase 1: Tool Summary + Runtime Line ──
-
-// coreToolOrder defines display priority for core tools (most used first).
-var coreToolOrder = []string{
-	"file_read", "file_write", "file_grep", "file_find", "file_list",
-	"file_patch", "file_move", "file_delete", "file_open",
-	"shell_exec",
-	"web_reader", "search_tavily", "search_brave", "http_request",
-	"time_get", "config_edit",
-}
-
-// mgmtToolOrder defines display priority for management tools.
-var mgmtToolOrder = []string{
-	"mcp_server_add", "mcp_server_remove", "mcp_server_list", "mcp_reload",
-}
-
-// buildToolingSection generates a compact tool summary section from Registry.
-// Tools are ordered by priority: core → management → external MCP (alphabetical).
-func buildToolingSection(registry *tool.Registry) string {
-	if registry == nil {
-		return ""
-	}
-
-	tools := registry.List()
-	if len(tools) == 0 {
-		return ""
-	}
-
-	// Build lookup map: name → tool
-	toolMap := make(map[string]tool.Tool, len(tools))
-	for _, t := range tools {
-		toolMap[t.Name()] = t
-	}
-
-	var sb strings.Builder
-	sb.WriteString("## Available Tools\n")
-
-	emitted := make(map[string]bool, len(tools))
-
-	// Emit in priority order
-	for _, name := range coreToolOrder {
-		if t, ok := toolMap[name]; ok {
-			sb.WriteString("- **")
-			sb.WriteString(name)
-			sb.WriteString("** — ")
-			sb.WriteString(firstLine(t.Description()))
-			sb.WriteByte('\n')
-			emitted[name] = true
-		}
-	}
-	for _, name := range mgmtToolOrder {
-		if t, ok := toolMap[name]; ok {
-			sb.WriteString("- **")
-			sb.WriteString(name)
-			sb.WriteString("** — ")
-			sb.WriteString(firstLine(t.Description()))
-			sb.WriteByte('\n')
-			emitted[name] = true
-		}
-	}
-
-	// Remaining tools (external MCP etc.) in alphabetical order
-	var extras []string
-	for _, t := range tools {
-		if !emitted[t.Name()] {
-			extras = append(extras, t.Name())
-		}
-	}
-	sort.Strings(extras)
-	for _, name := range extras {
-		t := toolMap[name]
-		sb.WriteString("- **")
-		sb.WriteString(name)
-		sb.WriteString("** — ")
-		sb.WriteString(firstLine(t.Description()))
-		sb.WriteByte('\n')
-	}
-
-	return sb.String()
-}
-
-// firstLine returns the first line of s (up to the first newline).
-func firstLine(s string) string {
-	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
-		return s[:idx]
-	}
-	return s
-}
-
-// buildRuntimeLine generates a compact one-line runtime environment summary.
-func buildRuntimeLine(state *AgentState) string {
-	osName := state.OSName
-	if osName == "" {
-		osName = "unknown"
-	}
-	shellCmd := state.ShellCmd
-	if shellCmd == "" {
-		shellCmd = "unknown"
-	}
-	modelName := state.ModelName
-	if modelName == "" {
-		modelName = "unknown"
-	}
-
-	return fmt.Sprintf(
-		"Runtime: os=%s | shell=%s | model=%s | ctx=%d | thinking=%s",
-		osName, shellCmd, modelName,
-		state.ContextWindowTokens,
-		state.ThinkingMode,
-	)
-}
-
-// containsMCPKeywords checks if the problem text mentions MCP or custom tool creation.
-// Used for Phase 2 intent-based conditional loading of MCP/skill guides.
-// Design: "server" alone is too broad (matches "web server", "database server"),
-// so it is omitted; "mcp" already covers all "mcp server" queries as a substring.
-// Prefers false positives over false negatives.
-func containsMCPKeywords(problem string) bool {
-	lower := strings.ToLower(problem)
-	keywords := []string{"mcp", "技能", "skill", "自定义工具", "custom tool"}
-	for _, kw := range keywords {
-		if strings.Contains(lower, kw) {
-			return true
-		}
-	}
-	return false
+	return "", ""
 }

@@ -69,6 +69,9 @@ func (l *ExecLogger) LogStep(step StepRecord) {
 
 	case "tool":
 		l.writef("**工具**: `%s`  \n", step.ToolName)
+		if step.DurationMs > 0 {
+			l.writef("**耗时**: %dms  \n", step.DurationMs)
+		}
 		if step.Input != "" {
 			l.writef("\n<details>\n<summary>输入参数</summary>\n\n```\n%s\n```\n\n</details>\n\n", step.Input)
 		}

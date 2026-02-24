@@ -22,10 +22,11 @@ type Server struct {
 	chatHandler    *ChatHandler
 	agentHandler   *AgentHandler   // Phase 2: Agent with tools
 	commandHandler *CommandHandler // Slash command handler
+	healthHandler  *HealthHandler  // GET /api/health
 }
 
 // NewServer creates a new web server with the given handlers.
-func NewServer(chatHandler *ChatHandler, agentHandler *AgentHandler, commandHandler *CommandHandler) (*Server, error) {
+func NewServer(chatHandler *ChatHandler, agentHandler *AgentHandler, commandHandler *CommandHandler, healthInfo HealthInfo) (*Server, error) {
 	tmpl, err := template.ParseFS(content, "templates/index.html")
 	if err != nil {
 		return nil, err
@@ -37,6 +38,7 @@ func NewServer(chatHandler *ChatHandler, agentHandler *AgentHandler, commandHand
 		chatHandler:    chatHandler,
 		agentHandler:   agentHandler,
 		commandHandler: commandHandler,
+		healthHandler:  NewHealthHandler(healthInfo),
 	}
 	s.registerRoutes()
 	return s, nil
@@ -52,6 +54,7 @@ func (s *Server) registerRoutes() {
 	if s.commandHandler != nil {
 		s.mux.HandleFunc("/api/command", s.commandHandler.HandleCommand)
 	}
+	s.mux.HandleFunc("/api/health", s.healthHandler.ServeHTTP)
 }
 
 // handleIndex serves the main page.

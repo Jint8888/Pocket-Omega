@@ -1,6 +1,6 @@
 // Package mcp provides MCP (Model Context Protocol) client support,
 // including server config loading, stdio/SSE transport, tool adapters,
-// and a security scanner for agent-created Python skill scripts.
+// and a security scanner for agent-created skill scripts (Python, TypeScript, JavaScript).
 package mcp
 
 import (
@@ -44,7 +44,9 @@ type sourceRule struct {
 	contextPattern *regexp.Regexp // optional secondary match
 }
 
-// lineRules are applied to each line of the script.
+// ── Python rules ──
+
+// lineRules are applied to each line of Python scripts.
 // sys.stdin / sys.stdout are intentionally not covered — they are legitimate
 // for MCP stdio communication and would create false positives.
 var lineRules = []lineRule{
@@ -68,7 +70,7 @@ var lineRules = []lineRule{
 	},
 }
 
-// sourceRules are applied against the full file content (multi-line context).
+// sourceRules are applied against the full Python file content (multi-line context).
 var sourceRules = []sourceRule{
 	{
 		name:     "env-harvesting",
@@ -93,13 +95,60 @@ var sourceRules = []sourceRule{
 	},
 }
 
-// ScanScript performs a static security scan on a Python script file.
-// Only .py files are processed; other file types return (nil, nil).
+// ── TypeScript / JavaScript rules ──
+
+// tsLineRules are applied to each line of TypeScript/JavaScript scripts.
+var tsLineRules = []lineRule{
+	{
+		name:     "dangerous-exec",
+		severity: SeverityCritical,
+		// child_process spawn/exec, execSync — dynamic process execution.
+		pattern: regexp.MustCompile(`\b(child_process|execSync|execFileSync|spawnSync)\b`),
+	},
+	{
+		name:     "dynamic-code",
+		severity: SeverityCritical,
+		// eval, Function constructor, vm.runInNewContext — dynamic code execution.
+		pattern: regexp.MustCompile(`\b(eval\s*\(|new\s+Function\s*\(|vm\.run)`),
+	},
+}
+
+// tsSourceRules are applied against the full TypeScript/JavaScript file content.
+var tsSourceRules = []sourceRule{
+	{
+		name:     "env-harvesting",
+		severity: SeverityCritical,
+		// process.env access combined with network I/O (fetch/http/https/axios).
+		pattern:        regexp.MustCompile(`process\.env`),
+		contextPattern: regexp.MustCompile(`\b(fetch\s*\(|https?\.|axios\.|node-fetch)`),
+	},
+	{
+		name:     "potential-exfil",
+		severity: SeverityWarn,
+		// fs.readFile combined with outbound network call.
+		pattern:        regexp.MustCompile(`\bfs\.(readFile|readFileSync|createReadStream)\b`),
+		contextPattern: regexp.MustCompile(`\b(fetch\s*\(|https?\.|axios\.|node-fetch)`),
+	},
+}
+
+// ScanScript performs a static security scan on a script file.
+// Supports .py, .ts, and .js files; other file types return (nil, nil).
 //
 // Critical findings should block script activation.
 // Warn findings are logged but allow activation to continue.
 func ScanScript(filePath string) ([]ScanFinding, error) {
-	if !strings.HasSuffix(filePath, ".py") {
+	var lRules []lineRule
+	var sRules []sourceRule
+	var isPython bool
+
+	switch {
+	case strings.HasSuffix(filePath, ".py"):
+		lRules, sRules = lineRules, sourceRules
+		isPython = true
+	case strings.HasSuffix(filePath, ".ts"), strings.HasSuffix(filePath, ".js"):
+		lRules, sRules = tsLineRules, tsSourceRules
+		isPython = false
+	default:
 		return nil, nil
 	}
 
@@ -118,13 +167,15 @@ func ScanScript(filePath string) ([]ScanFinding, error) {
 		lineNum++
 		line := scanner.Text()
 
-		// Skip comment-only lines (simple heuristic, not full Python parsing)
+		// Skip comment-only lines (language-aware prefix to avoid false skips:
+		// Python uses `#`, JS/TS uses `//`).
 		stripped := strings.TrimSpace(line)
-		if strings.HasPrefix(stripped, "#") {
+		if (isPython && strings.HasPrefix(stripped, "#")) ||
+			(!isPython && strings.HasPrefix(stripped, "//")) {
 			continue
 		}
 
-		for _, rule := range lineRules {
+		for _, rule := range lRules {
 			if rule.pattern.MatchString(line) {
 				findings = append(findings, ScanFinding{
 					Rule:     rule.name,
@@ -138,7 +189,7 @@ func ScanScript(filePath string) ([]ScanFinding, error) {
 	}
 
 	// Full-source rules
-	for _, rule := range sourceRules {
+	for _, rule := range sRules {
 		if !rule.pattern.MatchString(source) {
 			continue
 		}

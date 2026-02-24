@@ -109,6 +109,13 @@ func (s *Store) Delete(id string) {
 	delete(s.sessions, id)
 }
 
+// Count returns the number of active sessions.
+func (s *Store) Count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.sessions)
+}
+
 // Close stops the background cleanup goroutine. Safe to call multiple times.
 func (s *Store) Close() {
 	select {

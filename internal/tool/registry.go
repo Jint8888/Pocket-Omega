@@ -12,12 +12,22 @@ import (
 )
 
 // Registry manages all registered tools with thread-safe access.
+//
+// A Registry can be either a "root" registry (parent == nil) that owns its
+// tools map, or a "view" registry (parent != nil) created by WithExtra that
+// overlays additional tools on top of a parent. Views delegate Get/List to
+// the parent, so changes to the parent (Register/Unregister) are immediately
+// visible through the view. This is critical for mcp_reload: the agent holds
+// a view (via WithExtra for per-request tools like update_plan), while
+// mcp_reload modifies the root registry. Without delegation, unregistered
+// tools would remain visible to the agent.
 type Registry struct {
-	mu    sync.RWMutex
-	tools map[string]Tool
+	mu     sync.RWMutex
+	tools  map[string]Tool
+	parent *Registry // non-nil → view mode; tools map holds extras only
 }
 
-// NewRegistry creates an empty tool registry.
+// NewRegistry creates an empty root tool registry.
 func NewRegistry() *Registry {
 	return &Registry{
 		tools: make(map[string]Tool),
@@ -44,20 +54,59 @@ func (r *Registry) Unregister(name string) {
 }
 
 // Get retrieves a tool by name.
+// For view registries: checks extras first, then delegates to parent.
 func (r *Registry) Get(name string) (Tool, bool) {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
 	t, ok := r.tools[name]
-	return t, ok
+	r.mu.RUnlock()
+	if ok {
+		return t, true
+	}
+	if r.parent != nil {
+		return r.parent.Get(name)
+	}
+	return nil, false
 }
 
 // List returns all registered tools sorted by name.
+// For view registries: merges parent tools with extras (extras override parent).
 func (r *Registry) List() []Tool {
+	if r.parent != nil {
+		return r.listView()
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
 	result := make([]Tool, 0, len(r.tools))
 	for _, t := range r.tools {
+		result = append(result, t)
+	}
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Name() < result[j].Name()
+	})
+	return result
+}
+
+// listView merges parent tools with this view's extras.
+// Extras take precedence over parent tools with the same name.
+func (r *Registry) listView() []Tool {
+	parentTools := r.parent.List()
+
+	r.mu.RLock()
+	extras := make(map[string]Tool, len(r.tools))
+	for k, v := range r.tools {
+		extras[k] = v
+	}
+	r.mu.RUnlock()
+
+	// Build merged list: parent tools (excluding overridden) + extras
+	result := make([]Tool, 0, len(parentTools)+len(extras))
+	for _, t := range parentTools {
+		if _, overridden := extras[t.Name()]; !overridden {
+			result = append(result, t)
+		}
+	}
+	for _, t := range extras {
 		result = append(result, t)
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -127,19 +176,22 @@ func (r *Registry) CloseAll() {
 	}
 }
 
-// WithExtra returns a shallow copy of this Registry with additional tools appended.
+// WithExtra returns a view of this Registry with additional tools overlaid.
 // Used for per-request tool injection (e.g. update_plan with session context).
-// The returned Registry has an independent map; Tool instances themselves are shared
-// by reference but are designed to be stateless or self-synchronized.
+//
+// The returned Registry delegates Get/List to the parent, so changes to the
+// parent (via Register/Unregister) are immediately visible through the view.
+// Extras take precedence over parent tools with the same name.
+//
+// Can be chained: root.WithExtra(a).WithExtra(b) creates a view chain where
+// lookups check b's extras → a's extras → root's tools.
 func (r *Registry) WithExtra(extras ...Tool) *Registry {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	cp := &Registry{tools: make(map[string]Tool, len(r.tools)+len(extras))}
-	for k, v := range r.tools {
-		cp.tools[k] = v
-	}
+	extrasMap := make(map[string]Tool, len(extras))
 	for _, t := range extras {
-		cp.tools[t.Name()] = t
+		extrasMap[t.Name()] = t
 	}
-	return cp
+	return &Registry{
+		parent: r,
+		tools:  extrasMap,
+	}
 }

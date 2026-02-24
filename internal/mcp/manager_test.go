@@ -11,29 +11,45 @@ import (
 	"github.com/pocketomega/pocket-omega/internal/tool"
 )
 
-// ── findPyScript unit tests ────────────────────────────────────────────────
+// ── findScriptFile unit tests ────────────────────────────────────────────────
 
-func TestFindPyScript_CommandIsPy(t *testing.T) {
+func TestFindScriptFile_CommandIsPy(t *testing.T) {
 	cfg := ServerConfig{Command: "skills/my_tool.py", Args: []string{"--flag"}}
-	got := findPyScript(cfg)
+	got := findScriptFile(cfg)
 	if got != "skills/my_tool.py" {
-		t.Errorf("findPyScript() = %q, want %q", got, "skills/my_tool.py")
+		t.Errorf("findScriptFile() = %q, want %q", got, "skills/my_tool.py")
 	}
 }
 
-func TestFindPyScript_ArgIsPy(t *testing.T) {
+func TestFindScriptFile_ArgIsPy(t *testing.T) {
 	cfg := ServerConfig{Command: "python3", Args: []string{"--verbose", "skills/tool.py", "--port=8080"}}
-	got := findPyScript(cfg)
+	got := findScriptFile(cfg)
 	if got != "skills/tool.py" {
-		t.Errorf("findPyScript() = %q, want %q", got, "skills/tool.py")
+		t.Errorf("findScriptFile() = %q, want %q", got, "skills/tool.py")
 	}
 }
 
-func TestFindPyScript_NoPy(t *testing.T) {
-	cfg := ServerConfig{Command: "node", Args: []string{"server.js"}}
-	got := findPyScript(cfg)
+func TestFindScriptFile_NoPy(t *testing.T) {
+	cfg := ServerConfig{Command: "go", Args: []string{"run", "main.go"}}
+	got := findScriptFile(cfg)
 	if got != "" {
-		t.Errorf("findPyScript() = %q, want empty", got)
+		t.Errorf("findScriptFile() = %q, want empty", got)
+	}
+}
+
+func TestFindScriptFile_CommandIsTS(t *testing.T) {
+	cfg := ServerConfig{Command: "npx", Args: []string{"tsx", "skills/server.ts"}}
+	got := findScriptFile(cfg)
+	if got != "skills/server.ts" {
+		t.Errorf("findScriptFile() = %q, want %q", got, "skills/server.ts")
+	}
+}
+
+func TestFindScriptFile_ArgIsJS(t *testing.T) {
+	cfg := ServerConfig{Command: "node", Args: []string{"skills/server.js"}}
+	got := findScriptFile(cfg)
+	if got != "skills/server.js" {
+		t.Errorf("findScriptFile() = %q, want %q", got, "skills/server.js")
 	}
 }
 

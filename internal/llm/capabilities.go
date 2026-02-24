@@ -2,6 +2,13 @@ package llm
 
 import "strings"
 
+// normalizeModelName extracts the base model name by lowering case and
+// stripping provider prefixes like "Pro/deepseek-ai/DeepSeek-R1".
+func normalizeModelName(name string) string {
+	parts := strings.Split(strings.ToLower(name), "/")
+	return parts[len(parts)-1]
+}
+
 // ThinkingCapability describes a model's native thinking support.
 type ThinkingCapability struct {
 	SupportsNativeThinking bool // Whether the model supports native thinking
@@ -15,11 +22,7 @@ type ThinkingCapability struct {
 //  2. Keyword matching — model name contains thinking-related keywords
 //  3. Default — assume no native thinking support
 func DetectThinkingCapability(modelName string) ThinkingCapability {
-	lower := strings.ToLower(modelName)
-
-	// Strip common provider prefixes (e.g., "Pro/deepseek-ai/DeepSeek-R1")
-	parts := strings.Split(lower, "/")
-	baseName := parts[len(parts)-1]
+	baseName := normalizeModelName(modelName)
 
 	// 1. Known models with confirmed native thinking support
 	knownThinkingModels := []string{
@@ -42,6 +45,7 @@ func DetectThinkingCapability(modelName string) ThinkingCapability {
 		// Google Gemini thinking models
 		"gemini-2.5-flash", // has thinking mode
 		"gemini-2.5-pro",
+		"gemini-3.1", // Gemini 3.1 series with thinking
 		// Moonshot Kimi
 		"k1.5", // Kimi K1.5
 		"kimi-k1",
@@ -77,9 +81,7 @@ func DetectThinkingCapability(modelName string) ThinkingCapability {
 // Returns 0 for unrecognised models; callers should apply their own safe default.
 // Ordered from most to least specific prefix to avoid short-prefix false matches.
 func GetContextWindow(modelName string) int {
-	lower := strings.ToLower(modelName)
-	parts := strings.Split(lower, "/")
-	baseName := parts[len(parts)-1]
+	baseName := normalizeModelName(modelName)
 
 	knownWindows := []struct {
 		prefix string
@@ -109,6 +111,7 @@ func GetContextWindow(modelName string) int {
 		{"deepseek-v2", 128_000},
 		{"deepseek", 64_000},
 		// Google Gemini
+		{"gemini-3.1", 1_000_000},
 		{"gemini-2.5", 1_000_000},
 		{"gemini-2.0", 1_000_000},
 		{"gemini-1.5-pro", 2_000_000},
@@ -138,11 +141,7 @@ func GetContextWindow(modelName string) int {
 // based on a blacklist approach: most modern models support FC, so we only
 // exclude known unsupported ones.
 func DetectToolCallingCapability(modelName string) bool {
-	lower := strings.ToLower(modelName)
-
-	// Strip provider prefixes (e.g., "Pro/deepseek-ai/DeepSeek-V3")
-	parts := strings.Split(lower, "/")
-	baseName := parts[len(parts)-1]
+	baseName := normalizeModelName(modelName)
 
 	// Blacklist: models known NOT to support Function Calling.
 	// Uses exact match to avoid blocking future variants (e.g. "o1-mini-turbo").

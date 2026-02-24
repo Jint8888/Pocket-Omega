@@ -7,7 +7,9 @@ import (
 	"strconv"
 
 	"github.com/pocketomega/pocket-omega/internal/llm"
+	"github.com/pocketomega/pocket-omega/internal/plan"
 	"github.com/pocketomega/pocket-omega/internal/tool"
+	"github.com/pocketomega/pocket-omega/internal/walkthrough"
 )
 
 // AgentState is the shared state for the agent decision loop.
@@ -41,10 +43,18 @@ type AgentState struct {
 	CostGuard           *CostGuard                      `json:"-"` // nil = disabled; enforces token/duration limits
 	pendingCompact      bool                            // single-goroutine: set by Post (from Decision.ContextStatus), consumed in Post
 	OnContextOverflow   func(ctx context.Context) error `json:"-"` // injected by AgentHandler
+	WalkthroughStore    *walkthrough.Store              `json:"-"` // nil = disabled
+	WalkthroughSID      string                          `json:"-"` // session ID for walkthrough
+	PlanStore           *plan.PlanStore                 `json:"-"` // nil = disabled; plan status prompt injection
+	PlanSID             string                          `json:"-"` // session ID for plan status
+	ReadCache           *ReadCache                      `json:"-"` // nil = disabled; session-level file_read cache
+	MetaToolRedirectMsg string                          `json:"-"` // set by MetaToolGuard in Post, consumed by Prep
+	SuppressMetaTools   bool                            `json:"-"` // when true, Prep filters meta-tools from ToolDefinitions
 
 	// SSE callbacks
-	OnStepComplete func(StepRecord)   `json:"-"`
-	OnStreamChunk  func(chunk string) `json:"-"` // LLM streaming token callback
+	OnStepComplete func(StepRecord)            `json:"-"`
+	OnStreamChunk  func(chunk string)          `json:"-"` // LLM streaming token callback
+	OnPlanUpdate   func(steps []plan.PlanStep) `json:"-"` // Plan sideband SSE callback
 }
 
 // StepRecord records a single step execution.
@@ -57,16 +67,17 @@ type StepRecord struct {
 	Output     string `json:"output"`                 // Output result
 	ToolCallID string `json:"tool_call_id,omitempty"` // FC only: correlates with model's tool call
 	IsError    bool   `json:"is_error,omitempty"`     // true when tool returned an error
+	DurationMs int64  `json:"duration_ms,omitempty"`  // tool execution time in ms; only type=tool
 }
 
 // MaxAgentSteps prevents infinite decision loops.
-// Configurable via AGENT_MAX_STEPS env var (default: 40, min: 5, max: 200).
+// Configurable via AGENT_MAX_STEPS env var (default: 64, min: 5, max: 200).
 var MaxAgentSteps = loadMaxSteps()
 
 // loadMaxSteps reads AGENT_MAX_STEPS from the environment.
 // Extracted as a standalone function to allow direct unit testing.
 func loadMaxSteps() int {
-	const defaultSteps = 40
+	const defaultSteps = 64
 	v := os.Getenv("AGENT_MAX_STEPS")
 	if v == "" {
 		return defaultSteps
@@ -98,8 +109,11 @@ type DecidePrep struct {
 	HasMCPIntent        bool                 // Phase 2: whether Problem mentions MCP/skill keywords
 	ContextWindowTokens int                  // Phase 2: model context window for token budget guard
 	LoopDetected        DetectionResult      // LoopDetector: repetitive pattern detection result
+	ExplorationDetected ExplorationResult    // ExplorationDetector: exploration overrun detection
 	CostGuard           *CostGuard           // pointer shared with state for Exec to record tokens
 	SystemPromptEst     int                  // estimated system prompt tokens (computed in Prep)
+	WalkthroughText     string               // Render output, injected into prompt
+	PlanText            string               // PlanStore.Render output, injected into prompt
 }
 
 // Decision is the LLM's decision output.
@@ -114,6 +128,12 @@ type Decision struct {
 	Answer        string         `yaml:"answer"`      // Used when action=answer
 	ToolCallID    string         `yaml:"-"`           // FC only: tool call ID for result correlation
 	ContextStatus ContextStatus  `yaml:"-"`           // set by Exec when context window is filling up
+
+	// Plan sideband — plan status update piggybacked on Decision.
+	// YAML mode: auto-parsed via yaml tags.
+	// FC mode: parsed from reason text via [plan:step_id:status] marker.
+	PlanStep   string `yaml:"plan_step,omitempty"`   // e.g. "create_server"
+	PlanStatus string `yaml:"plan_status,omitempty"` // "in_progress" | "done"
 }
 
 // ── ToolNode generic types ──
@@ -122,9 +142,10 @@ type Decision struct {
 // ToolPrep is prepared by reading LastDecision and converting ToolParams.
 type ToolPrep struct {
 	ToolName     string
-	Args         []byte    // json.RawMessage from json.Marshal(Decision.ToolParams)
-	ToolCallID   string    // FC only: correlates tool result with the model's tool call
-	ResolvedTool tool.Tool // resolved in Prep from state.ToolRegistry; nil = not found
+	Args         []byte     // json.RawMessage from json.Marshal(Decision.ToolParams)
+	ToolCallID   string     // FC only: correlates tool result with the model's tool call
+	ResolvedTool tool.Tool  // resolved in Prep from state.ToolRegistry; nil = not found
+	ReadCache    *ReadCache // nil = disabled; for duplicate read interception
 }
 
 // ToolExecResult is the result of executing a tool.
@@ -133,6 +154,7 @@ type ToolExecResult struct {
 	Output     string
 	Error      string
 	ToolCallID string // FC only: passed through for multi-turn conversation history
+	DurationMs int64  // execution time in milliseconds
 }
 
 // ── ThinkNode generic types ──

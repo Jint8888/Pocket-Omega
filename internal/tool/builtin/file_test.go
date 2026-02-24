@@ -663,3 +663,86 @@ func TestFileWriteTool_SymlinkEscape(t *testing.T) {
 		t.Error("file should not have been created outside workspace via symlink")
 	}
 }
+
+// ── Protected file guard tests ──────────────────────────────────────────────
+
+func TestProtectedFile_WriteBlocked(t *testing.T) {
+	workspace := t.TempDir()
+	tool := NewFileWriteTool(workspace)
+
+	args, _ := json.Marshal(fileWriteArgs{
+		Path:    "mcp.json",
+		Content: `{"test": true}`,
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error == "" || !strings.Contains(result.Error, "禁止直接修改") {
+		t.Errorf("expected protected file error, got: %+v", result)
+	}
+	// Verify file was NOT created
+	if _, statErr := os.Stat(filepath.Join(workspace, "mcp.json")); !os.IsNotExist(statErr) {
+		t.Error("mcp.json should not have been created by file_write")
+	}
+}
+
+func TestProtectedFile_PatchBlocked(t *testing.T) {
+	workspace := t.TempDir()
+	// Create mcp.json so patch has something to read
+	os.WriteFile(filepath.Join(workspace, "mcp.json"), []byte(`{"old": true}`), 0644)
+
+	tool := NewFilePatchTool(workspace)
+	args, _ := json.Marshal(filePatchArgs{
+		Path:      "mcp.json",
+		StartLine: 1,
+		EndLine:   1,
+		Content:   `{"new": true}`,
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error == "" || !strings.Contains(result.Error, "禁止直接修改") {
+		t.Errorf("expected protected file error, got: %+v", result)
+	}
+}
+
+func TestProtectedFile_DeleteBlocked(t *testing.T) {
+	workspace := t.TempDir()
+	os.WriteFile(filepath.Join(workspace, "mcp.json"), []byte(`{}`), 0644)
+
+	tool := NewFileDeleteTool(workspace)
+	args, _ := json.Marshal(fileDeleteArgs{
+		Path:    "mcp.json",
+		Confirm: "yes",
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error == "" || !strings.Contains(result.Error, "禁止直接修改") {
+		t.Errorf("expected protected file error, got: %+v", result)
+	}
+	// Verify file still exists
+	if _, statErr := os.Stat(filepath.Join(workspace, "mcp.json")); os.IsNotExist(statErr) {
+		t.Error("mcp.json should not have been deleted")
+	}
+}
+
+func TestProtectedFile_NonProtectedAllowed(t *testing.T) {
+	workspace := t.TempDir()
+	tool := NewFileWriteTool(workspace)
+
+	args, _ := json.Marshal(fileWriteArgs{
+		Path:    "config.json",
+		Content: `{"allowed": true}`,
+	})
+	result, err := tool.Execute(context.Background(), args)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Error != "" {
+		t.Errorf("non-protected file should be writable, got error: %s", result.Error)
+	}
+}

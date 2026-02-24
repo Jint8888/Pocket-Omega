@@ -20,20 +20,14 @@ const (
 // paramDedupTools maps tool names to the JSON key used for deduplication.
 // These tools are exempt from pure frequency counting in Rule 1 —
 // they only count if the specified param is also identical.
-var paramDedupTools = map[string]string{
-	"file_read":   "path",
-	"file_write":  "path",
-	"file_patch":  "path",
-	"file_list":   "path",
-	"file_move":   "path",
-	"file_delete": "path",
-	"file_grep":   "path",
-	"shell_exec":  "command",
+//
+// Built from baseToolKeyParams (tool_params.go) + loop-detector-specific extras.
+var paramDedupTools = mergeToolKeyParams(map[string]string{
 	// update_plan is a plan management tool legitimately called multiple times
 	// per task (set + one update per step). Dedup by step_id so only repeated
 	// calls on the same step trigger the loop detector.
 	"update_plan": "step_id",
-}
+})
 
 // toolCallKey returns the deduplication key for Rule 1.
 // Whitelist tools (paramDedupTools): use the specified semantic param as key.
@@ -57,12 +51,15 @@ type DetectionResult struct {
 	Detected    bool   // whether a loop was detected
 	Rule        string // which rule triggered: "same_tool_freq", "similar_params", "consecutive_errors"
 	Description string // human-readable description for prompt injection
+	ToolName    string // the tool that triggered the detection (for self-correction check)
 }
 
 // Check analyzes the step history and returns detection result.
 // Rules are evaluated in order; first match wins.
+// Meta-tools (update_plan, walkthrough) are excluded — their repeated calls
+// are harmless bookkeeping and should not trigger loop detection.
 func (d *LoopDetector) Check(steps []StepRecord) DetectionResult {
-	toolSteps := filterToolSteps(steps)
+	toolSteps := filterNonMetaToolSteps(steps)
 	if len(toolSteps) < 2 {
 		return DetectionResult{}
 	}
@@ -114,6 +111,7 @@ func (d *LoopDetector) checkSameToolFrequency(toolSteps []StepRecord) DetectionR
 				Detected:    true,
 				Rule:        "same_tool_freq",
 				Description: desc,
+				ToolName:    k.name,
 			}
 		}
 	}
@@ -155,6 +153,7 @@ func (d *LoopDetector) checkSimilarParams(toolSteps []StepRecord) DetectionResul
 			Detected:    true,
 			Rule:        "similar_params",
 			Description: last.ToolName + " 连续调用且参数相似",
+			ToolName:    last.ToolName,
 		}
 	}
 	return DetectionResult{}
@@ -183,17 +182,6 @@ func (d *LoopDetector) checkConsecutiveErrors(toolSteps []StepRecord) DetectionR
 }
 
 // ── Helpers ──
-
-// filterToolSteps extracts only type="tool" steps from history.
-func filterToolSteps(steps []StepRecord) []StepRecord {
-	var result []StepRecord
-	for _, s := range steps {
-		if s.Type == "tool" {
-			result = append(result, s)
-		}
-	}
-	return result
-}
 
 // recentWindow returns the last n items from a slice.
 func recentWindow(steps []StepRecord, n int) []StepRecord {

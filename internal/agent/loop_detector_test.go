@@ -40,7 +40,8 @@ func TestCheck_SameToolFrequency_HashDedup_DiffParams(t *testing.T) {
 }
 
 func TestCheck_SameToolFrequency_UpdatePlanSameStepID(t *testing.T) {
-	// Whitelist tool (update_plan): same step_id but different status → triggers (semantic dedup)
+	// Meta-tool (update_plan) is excluded from LoopDetector — repeated calls
+	// are harmless bookkeeping. Dedup warnings in StepSummary handle visibility.
 	steps := []StepRecord{
 		{Type: "tool", ToolName: "update_plan", Input: `{"step_id":"1","status":"in_progress"}`, StepNumber: 1},
 		{Type: "tool", ToolName: "update_plan", Input: `{"step_id":"1","status":"done"}`, StepNumber: 2},
@@ -48,8 +49,8 @@ func TestCheck_SameToolFrequency_UpdatePlanSameStepID(t *testing.T) {
 	}
 	d := LoopDetector{}
 	r := d.Check(steps)
-	if !r.Detected || r.Rule != "same_tool_freq" {
-		t.Fatalf("expected same_tool_freq for update_plan with same step_id, got detected=%v rule=%s", r.Detected, r.Rule)
+	if r.Detected {
+		t.Fatalf("meta-tool update_plan should NOT trigger loop detection, got rule=%s", r.Rule)
 	}
 }
 
@@ -339,7 +340,8 @@ func TestCheck_UpdatePlan_DifferentStepIDs(t *testing.T) {
 }
 
 func TestCheck_UpdatePlan_SameStepIDRepeated(t *testing.T) {
-	// update same step_id 3 times — real loop, must trigger
+	// Meta-tool (update_plan) is excluded from LoopDetector — even 3 identical
+	// calls should NOT trigger, as they are harmless idempotent bookkeeping.
 	steps := []StepRecord{
 		{Type: "tool", ToolName: "update_plan", Input: `{"operation":"update","step_id":"stepA","status":"in_progress"}`, StepNumber: 1},
 		{Type: "tool", ToolName: "update_plan", Input: `{"operation":"update","step_id":"stepA","status":"in_progress"}`, StepNumber: 2},
@@ -347,11 +349,8 @@ func TestCheck_UpdatePlan_SameStepIDRepeated(t *testing.T) {
 	}
 	d := LoopDetector{}
 	r := d.Check(steps)
-	if !r.Detected {
-		t.Fatal("expected detection: same step_id updated 3 times")
-	}
-	if r.Rule != "same_tool_freq" {
-		t.Fatalf("expected same_tool_freq, got %s", r.Rule)
+	if r.Detected {
+		t.Fatalf("meta-tool update_plan should NOT trigger loop detection, got rule=%s", r.Rule)
 	}
 }
 

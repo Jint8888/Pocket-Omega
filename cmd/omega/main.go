@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pocketomega/pocket-omega/internal/agent"
+	"github.com/pocketomega/pocket-omega/internal/config"
 	"github.com/pocketomega/pocket-omega/internal/llm/openai"
 	"github.com/pocketomega/pocket-omega/internal/mcp"
 	"github.com/pocketomega/pocket-omega/internal/plan"
@@ -20,8 +21,8 @@ import (
 	"github.com/pocketomega/pocket-omega/internal/session"
 	"github.com/pocketomega/pocket-omega/internal/tool"
 	"github.com/pocketomega/pocket-omega/internal/tool/builtin"
+	"github.com/pocketomega/pocket-omega/internal/walkthrough"
 	"github.com/pocketomega/pocket-omega/internal/web"
-	"github.com/pocketomega/pocket-omega/pkg/config"
 )
 
 func main() {
@@ -155,6 +156,7 @@ func main() {
 
 	// Initialize MCP client manager (optional — only when mcp.json exists)
 	var mcpReloadFn func() // captured from MCP block for /reload command
+	var mcpServerCount int // captured from MCP block for /api/health
 	mcpConfigPath := os.Getenv("MCP_CONFIG")
 	if mcpConfigPath == "" {
 		mcpConfigPath = filepath.Join(workspaceDir, "mcp.json")
@@ -194,6 +196,7 @@ func main() {
 			}
 			fmt.Printf("🔌 MCP: %d server(s) connected\n", n)
 		}
+		mcpServerCount = n
 		defer mcpMgr.CloseAll()
 
 		// Inject runtime probe result into mcp_server_guide.md so agents read
@@ -245,6 +248,9 @@ func main() {
 	// Initialize plan store for structured task tracking
 	planStore := plan.NewPlanStore()
 
+	// Initialize walkthrough store for agent memo tracking
+	walkthroughStore := walkthrough.NewStore()
+
 	// Create handlers
 	thinkingMode := llmClient.GetConfig().ResolveThinkingMode()
 	toolCallMode := llmClient.GetConfig().ToolCallMode // raw value: "auto", "fc", or "yaml"
@@ -280,6 +286,7 @@ func main() {
 		PlanStore:           planStore,
 		MaxAgentTokens:      maxAgentTokens,
 		MaxAgentDuration:    maxAgentDuration,
+		WalkthroughStore:    walkthroughStore,
 	})
 	fmt.Printf("🧠 Thinking: %s\n", thinkingMode)
 	fmt.Printf("🔧 ToolCall: %s (resolved: %s)\n", toolCallMode, llmClient.GetConfig().ResolveToolCallMode())
@@ -287,14 +294,23 @@ func main() {
 
 	// Create slash command handler (/compact needs LLM for summary generation)
 	commandHandler := web.NewCommandHandler(web.CommandHandlerOptions{
-		Loader:      promptLoader,
-		MCPReload:   mcpReloadFn, // nil-safe: cmdReload checks for nil
-		Store:       sessionStore,
-		LLMProvider: llmClient,
+		Loader:       promptLoader,
+		MCPReload:    mcpReloadFn, // nil-safe: cmdReload checks for nil
+		Store:        sessionStore,
+		LLMProvider:  llmClient,
+		ToolRegistry: registry,
+		ModelName:    model,
+		ThinkingMode: thinkingMode,
+		ToolCallMode: toolCallMode,
 	})
 
 	// Create and start web server
-	server, err := web.NewServer(chatHandler, agentHandler, commandHandler)
+	server, err := web.NewServer(chatHandler, agentHandler, commandHandler, web.HealthInfo{
+		LLMModel:       model,
+		ToolCount:      len(registry.List()),
+		MCPServerCount: mcpServerCount,
+		SessionCount:   sessionStore.Count,
+	})
 	if err != nil {
 		log.Fatalf("❌ Failed to create web server: %v", err)
 	}

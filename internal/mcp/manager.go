@@ -226,6 +226,7 @@ func (m *Manager) Reload(ctx context.Context, registry *tool.Registry) (string, 
 	m.mu.Lock()
 	toRemove := make([]string, 0)
 	toAdd := make([]ServerConfig, 0)
+	toModify := make([]string, 0) // config-changed servers (will appear in both toRemove and toAdd)
 	unchanged := 0
 
 	for name := range m.configs {
@@ -234,8 +235,13 @@ func (m *Manager) Reload(ctx context.Context, registry *tool.Registry) (string, 
 		}
 	}
 	for name, cfg := range newConfigs {
-		if _, exists := m.configs[name]; !exists {
+		if oldCfg, exists := m.configs[name]; !exists {
 			toAdd = append(toAdd, cfg)
+		} else if !configEqual(oldCfg, cfg) {
+			// Config changed: schedule remove + re-add (reconnect with new config).
+			toRemove = append(toRemove, name)
+			toAdd = append(toAdd, cfg)
+			toModify = append(toModify, name)
 		} else {
 			unchanged++
 		}
@@ -282,7 +288,7 @@ func (m *Manager) Reload(ctx context.Context, registry *tool.Registry) (string, 
 
 		// Security scan for stdio scripts. Persists scan_result + scanned_at to mcp.json _meta.
 		if cfg.Transport == "stdio" {
-			pyScript := findPyScript(cfg)
+			pyScript := findScriptFile(cfg)
 			if pyScript != "" {
 				findings, scanErr := ScanScript(pyScript)
 				today := time.Now().Format("2006-01-02")
@@ -390,8 +396,20 @@ func (m *Manager) Reload(ctx context.Context, registry *tool.Registry) (string, 
 		log.Printf("[MCP] Connected: %s (%s), %d tool(s)", res.name, res.cfg.Transport, len(res.tools))
 	}
 
-	summary := fmt.Sprintf("MCP reload: +%d connected, -%d removed, %d unchanged",
-		added, removed, unchanged)
+	// Count successfully reconnected modified servers.
+	modifySet := make(map[string]bool, len(toModify))
+	for _, name := range toModify {
+		modifySet[name] = true
+	}
+	modifiedOK := 0
+	for _, res := range addResults {
+		if modifySet[res.name] && !res.blocked && res.err == nil {
+			modifiedOK++
+		}
+	}
+
+	summary := fmt.Sprintf("MCP reload: +%d connected, ~%d modified, -%d removed, %d unchanged",
+		added-modifiedOK, modifiedOK, removed-len(toModify), unchanged)
 	if len(notices) > 0 {
 		summary += "\n" + strings.Join(notices, "\n")
 	}
@@ -485,15 +503,43 @@ func updateServerMeta(configPath, serverName string, updates map[string]string) 
 	}
 }
 
-// findPyScript returns the first .py file referenced in a ServerConfig,
-// checking the command itself and then the argument list.
-func findPyScript(cfg ServerConfig) string {
-	if strings.HasSuffix(cfg.Command, ".py") {
-		return cfg.Command
+// configEqual reports whether two ServerConfig values are functionally identical.
+// Only fields that affect runtime behaviour are compared; Name and _meta are excluded.
+func configEqual(a, b ServerConfig) bool {
+	if a.Transport != b.Transport || a.Command != b.Command || a.URL != b.URL || a.Lifecycle != b.Lifecycle {
+		return false
 	}
-	for _, arg := range cfg.Args {
-		if strings.HasSuffix(arg, ".py") {
-			return arg
+	if len(a.Args) != len(b.Args) {
+		return false
+	}
+	for i := range a.Args {
+		if a.Args[i] != b.Args[i] {
+			return false
+		}
+	}
+	if len(a.Env) != len(b.Env) {
+		return false
+	}
+	for i := range a.Env {
+		if a.Env[i] != b.Env[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// findScriptFile returns the first scannable script (.py/.ts/.js) in a ServerConfig,
+// checking the command itself and then the argument list.
+func findScriptFile(cfg ServerConfig) string {
+	exts := []string{".py", ".ts", ".js"}
+	for _, ext := range exts {
+		if strings.HasSuffix(cfg.Command, ext) {
+			return cfg.Command
+		}
+		for _, arg := range cfg.Args {
+			if strings.HasSuffix(arg, ext) {
+				return arg
+			}
 		}
 	}
 	return ""

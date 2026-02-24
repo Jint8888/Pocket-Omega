@@ -1,6 +1,7 @@
 package plan
 
 import (
+	"strings"
 	"sync"
 	"testing"
 )
@@ -116,4 +117,124 @@ func TestPlanStore_ConcurrentAccess(t *testing.T) {
 	wg.Wait()
 
 	// If we reach here without -race detector panic, mutex is working
+}
+
+func TestPlanStore_Render(t *testing.T) {
+	ps := NewPlanStore()
+	ps.Set("sess1", []PlanStep{
+		{ID: "read_env", Title: "读取环境变量", Status: "done"},
+		{ID: "create_server", Title: "创建 MCP Server", Status: "in_progress"},
+		{ID: "install_deps", Title: "安装依赖"},
+		{ID: "verify", Title: "验证功能", Status: "error"},
+		{ID: "cleanup", Title: "清理临时文件", Status: "skipped"},
+	})
+
+	rendered := ps.Render("sess1")
+
+	// Header
+	if !strings.Contains(rendered, "## 执行计划") {
+		t.Error("missing header")
+	}
+	// Status icons
+	if !strings.Contains(rendered, "[x] read_env") {
+		t.Error("missing done icon [x]")
+	}
+	if !strings.Contains(rendered, "[→] create_server") {
+		t.Error("missing in_progress icon [→]")
+	}
+	if !strings.Contains(rendered, "[ ] install_deps") {
+		t.Error("missing pending icon [ ]")
+	}
+	if !strings.Contains(rendered, "[!] verify") {
+		t.Error("missing error icon [!]")
+	}
+	if !strings.Contains(rendered, "[-] cleanup") {
+		t.Error("missing skipped icon [-]")
+	}
+	// Title preserved
+	if !strings.Contains(rendered, "读取环境变量") {
+		t.Error("missing step title")
+	}
+	// Status signal
+	if !strings.Contains(rendered, "计划已设置") {
+		t.Error("missing status signal")
+	}
+	if !strings.Contains(rendered, "1/5 完成") {
+		t.Errorf("wrong progress count, got: %s", rendered)
+	}
+}
+
+func TestPlanStore_RenderStatusSignal(t *testing.T) {
+	ps := NewPlanStore()
+
+	t.Run("next step points to first pending", func(t *testing.T) {
+		ps.Set("s1", []PlanStep{
+			{ID: "done_step", Title: "Done", Status: "done"},
+			{ID: "next_step", Title: "Next", Status: "pending"},
+			{ID: "later_step", Title: "Later", Status: "pending"},
+		})
+		rendered := ps.Render("s1")
+		if !strings.Contains(rendered, "用实际工具执行 next_step") {
+			t.Errorf("should point to first pending step, got: %s", rendered)
+		}
+		if !strings.Contains(rendered, "1/3 完成") {
+			t.Errorf("wrong progress, got: %s", rendered)
+		}
+	})
+
+	t.Run("next step points to in_progress over pending", func(t *testing.T) {
+		ps.Set("s2", []PlanStep{
+			{ID: "active", Title: "Active", Status: "in_progress"},
+			{ID: "waiting", Title: "Waiting", Status: "pending"},
+		})
+		rendered := ps.Render("s2")
+		if !strings.Contains(rendered, "用实际工具执行 active") {
+			t.Errorf("should point to in_progress step, got: %s", rendered)
+		}
+	})
+
+	t.Run("all done omits next step", func(t *testing.T) {
+		ps.Set("s3", []PlanStep{
+			{ID: "a", Title: "A", Status: "done"},
+			{ID: "b", Title: "B", Status: "done"},
+		})
+		rendered := ps.Render("s3")
+		if strings.Contains(rendered, "下一步") {
+			t.Errorf("all done should not have next step hint, got: %s", rendered)
+		}
+		if !strings.Contains(rendered, "2/2 完成") {
+			t.Errorf("wrong progress, got: %s", rendered)
+		}
+	})
+
+	t.Run("contains anti-repeat warning", func(t *testing.T) {
+		ps.Set("s4", []PlanStep{
+			{ID: "x", Title: "X", Status: "pending"},
+		})
+		rendered := ps.Render("s4")
+		if !strings.Contains(rendered, "不是 update_plan") {
+			t.Errorf("missing anti-repeat warning, got: %s", rendered)
+		}
+	})
+}
+
+func TestPlanStore_RenderEmpty(t *testing.T) {
+	ps := NewPlanStore()
+	if got := ps.Render("nonexistent"); got != "" {
+		t.Errorf("expected empty string for no plan, got %q", got)
+	}
+}
+
+func TestPlanStore_RenderUnknownStatus(t *testing.T) {
+	ps := NewPlanStore()
+	// Directly set a step with an unknown status via internal manipulation
+	ps.Set("sess1", []PlanStep{
+		{ID: "s1", Title: "Unknown status step", Status: "unknown_status"},
+	})
+
+	rendered := ps.Render("sess1")
+	// Unknown status should fall back to [ ]
+	if !strings.Contains(rendered, "[ ] s1") {
+		t.Errorf("expected fallback [ ] for unknown status, got: %s", rendered)
+	}
 }

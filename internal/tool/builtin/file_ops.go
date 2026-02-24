@@ -69,6 +69,14 @@ func (t *FileMoveTool) Execute(_ context.Context, args json.RawMessage) (tool.To
 		return tool.ToolResult{Error: fmt.Sprintf("目标路径无效: %v", err)}, nil
 	}
 
+	// Protected file guard: block move of mcp.json etc.
+	if msg := checkProtectedFile(srcPath, t.workspaceDir); msg != "" {
+		return tool.ToolResult{Error: msg}, nil
+	}
+	if msg := checkProtectedFile(dstPath, t.workspaceDir); msg != "" {
+		return tool.ToolResult{Error: msg}, nil
+	}
+
 	// Forbid moving workspace root itself
 	absWorkspace, _ := filepath.Abs(t.workspaceDir)
 	absSrc, _ := filepath.Abs(srcPath)
@@ -248,6 +256,11 @@ func (t *FileDeleteTool) Execute(_ context.Context, args json.RawMessage) (tool.
 		return tool.ToolResult{Error: err.Error()}, nil
 	}
 
+	// Protected file guard: block deletion of mcp.json etc.
+	if msg := checkProtectedFile(path, t.workspaceDir); msg != "" {
+		return tool.ToolResult{Error: msg}, nil
+	}
+
 	// Forbid deleting workspace root
 	absWorkspace, _ := filepath.Abs(t.workspaceDir)
 	absPath, _ := filepath.Abs(path)
@@ -347,6 +360,11 @@ func (t *FilePatchTool) Execute(_ context.Context, args json.RawMessage) (tool.T
 	path, err := safeResolvePath(a.Path, t.workspaceDir)
 	if err != nil {
 		return tool.ToolResult{Error: err.Error()}, nil
+	}
+
+	// Protected file guard: block patching of mcp.json etc.
+	if msg := checkProtectedFile(path, t.workspaceDir); msg != "" {
+		return tool.ToolResult{Error: msg}, nil
 	}
 
 	// Open to read current content

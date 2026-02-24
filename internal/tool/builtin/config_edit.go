@@ -42,7 +42,7 @@ func (t *ConfigEditTool) Description() string {
 	}
 	sort.Strings(files)
 	return fmt.Sprintf(
-		"读写工作区外的配置文件（如 .env）。支持 get/set/list 操作。可编辑文件: %s",
+		"读写工作区外的配置文件（如 .env）。操作: list=查看所有键值对, get=读取指定key的值, set=设置key=value。可编辑文件: %s",
 		strings.Join(files, ", "),
 	)
 }
@@ -65,7 +65,7 @@ func (t *ConfigEditTool) InputSchema() json.RawMessage {
 		tool.SchemaParam{
 			Name:        "key",
 			Type:        "string",
-			Description: "配置键名（get/set 必填）",
+			Description: "配置键名（get/set 时必填；list 时不需要）",
 			Required:    false,
 		},
 		tool.SchemaParam{

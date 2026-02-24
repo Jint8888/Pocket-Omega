@@ -46,6 +46,11 @@ func NewClient(config *Config) (*Client, error) {
 	httpTimeout := time.Duration(config.HTTPTimeout) * time.Second
 	clientConfig.HTTPClient = &http.Client{Timeout: httpTimeout}
 
+	// Eagerly resolve and cache auto-detected modes so that per-call methods
+	// can use the cached fields directly without repeated detection + log noise.
+	config.ResolveThinkingMode()
+	config.ResolveToolCallMode()
+
 	return &Client{
 		client: openailib.NewClientWithConfig(clientConfig),
 		config: config,
@@ -88,7 +93,7 @@ func (c *Client) CallLLM(ctx context.Context, messages []llm.Message) (llm.Messa
 		req.MaxTokens = c.config.MaxTokens
 	}
 	// Enable native thinking for supported models
-	if c.config.ResolveThinkingMode() == "native" {
+	if c.config.resolvedThinkingMode == "native" {
 		req.ReasoningEffort = c.config.ReasoningEffort
 	}
 
@@ -160,7 +165,7 @@ func (c *Client) CallLLMStream(ctx context.Context, messages []llm.Message, onCh
 		req.MaxTokens = c.config.MaxTokens
 	}
 	// Enable native thinking for supported models
-	if c.config.ResolveThinkingMode() == "native" {
+	if c.config.resolvedThinkingMode == "native" {
 		req.ReasoningEffort = c.config.ReasoningEffort
 	}
 
@@ -264,6 +269,10 @@ func (c *Client) CallLLMWithTools(ctx context.Context, messages []llm.Message, t
 	}
 	if c.config.MaxTokens > 0 {
 		req.MaxTokens = c.config.MaxTokens
+	}
+	// Enable native thinking for supported models (consistent with CallLLM/CallLLMStream)
+	if c.config.resolvedThinkingMode == "native" {
+		req.ReasoningEffort = c.config.ReasoningEffort
 	}
 
 	// Execute with retries

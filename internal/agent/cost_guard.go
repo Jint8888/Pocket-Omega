@@ -58,3 +58,6 @@ func (g *CostGuard) CheckDuration() error {
 
 // IsExceeded returns true if any budget/duration limit has been exceeded.
 func (g *CostGuard) IsExceeded() bool { return g.exceeded }
+
+// UsedTokens returns the total tokens consumed so far.
+func (g *CostGuard) UsedTokens() int64 { return g.usedTokens.Load() }

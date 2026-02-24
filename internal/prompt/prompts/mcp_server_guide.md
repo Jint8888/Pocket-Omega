@@ -30,19 +30,43 @@
 
 ---
 
-## 创建流程（必须严格按顺序执行）
+## 创建流程（必须严格按顺序执行，每步完成后立即执行下一步）
+
+> ⚠️ **执行纪律**：用 update_plan(set) 设置计划后，**立即**从 Step 1 开始执行。
+> 每完成一步，在 reason 中用 `[plan:步骤ID:done]` 标记完成，然后**立即**执行下一步。
+> **禁止**在步骤之间重复调用 update_plan(set)。
 
 ```
-Step 1  调用 mcp_server_list，确认目标名称尚未注册（避免冲突）
-Step 2  按运行时规则选择语言模板
-Step 3  使用 file_write 创建实现文件（TypeScript: server.ts + package.json）
-Step 4  执行依赖安装（TypeScript: npm install；Python: 用户手动 pip install）
-Step 5  调用 mcp_server_add 注册到 mcp.json
-Step 6  调用 mcp_reload 热加载
-Step 7  调用新工具验证功能
-Step 8  创建 skills/<name>/README.md 使用说明文档（模板见下方）
-Step 9  回报完成
+Step 1  调用 mcp_server_list，确认目标名称尚未注册 → 完成后立即进入 Step 2
+Step 2  按运行时规则选择语言模板（纯决策，无需工具调用）→ 立即进入 Step 3
+Step 3  使用 file_write 创建实现文件（TypeScript: server.ts + package.json）→ 立即进入 Step 4
+Step 4  执行依赖安装（TypeScript: npm install；Python: uv pip install -r requirements.txt）→ 立即进入 Step 5
+Step 5  调用 mcp_server_add 注册到 mcp.json（⚠️ command 和 args 中的路径必须使用绝对路径）→ 立即进入 Step 6
+Step 6  调用 mcp_reload 热加载 → 立即进入 Step 7
+Step 7  验证功能（⚠️ 严格按下方验证规程执行，不要自行发挥）→ 立即进入 Step 8
+Step 8  创建 skills/<name>/README.md 使用说明文档（模板见下方）→ 立即进入 Step 9
+Step 9  answer 回报完成（计划状态已通过侧信道自动更新）
 ```
+
+### Step 7 验证规程（必须严格遵守，禁止自行发挥）
+
+验证分两步，最多消耗 3 个工具调用：
+
+**7a. 确认连接状态**：检查 Step 6 `mcp_reload` 的返回值。
+- 如果返回 `+N connected`（N≥1），说明 server 进程已启动并连接成功，进入 7b
+- 如果返回 `+0 connected` 或报错，说明启动失败，参考下方「连接失败诊断」排查
+
+**7b. 调用工具验证**：直接调用 `mcp_<serverName>__<toolName>` 执行一次简单测试。
+- 工具调用名 = `mcp_` + mcp_server_add 时的 name + `__` + server 代码中定义的工具名
+- 示例：name=`crawl4ai`，工具=`crawl_url` → `mcp_crawl4ai__crawl_url`
+- ⚠️ serverName 必须与 mcp_server_add 的 name 参数**完全一致**，不要省略或修改任何部分
+- 使用最简参数测试即可，不需要复杂输入
+- 如果工具调用成功（无论返回内容是否完美），验证通过，进入 Step 8
+- 如果工具调用失败，记录错误信息，仍然进入 Step 8（在 README 中注明已知问题）
+
+**⚠️ 验证阶段禁止事项**：
+- 禁止用 `find` 搜索工具名（find 搜索的是文件系统，不是工具列表）
+- 禁止调用其他 server 的工具来"测试"（如 enhanced-search、github 等与当前 skill 无关）
 
 ---
 
@@ -141,10 +165,10 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 ```
 
-对应 `mcp_server_add` 调用：
+对应 `mcp_server_add` 调用（⚠️ command 和 args 中的文件路径必须使用绝对路径）：
 ```
 name="<server-name>", transport="stdio",
-command="node", args=["--import", "tsx", "skills/<name>/server.ts"],
+command="node", args=["--import", "tsx", "{WORKSPACE_DIR}/skills/<name>/server.ts"],
 lifecycle="persistent"
 ```
 
@@ -152,8 +176,8 @@ lifecycle="persistent"
 
 ## Python 模板（依赖 Python 生态时使用）
 
-> **⚠️ 依赖说明**：Python 依赖需用户手动安装（`pip install mcp`），
-> Agent 不自动执行 pip install。须在 `requirements.txt` 中声明依赖。
+> **⚠️ 依赖说明**：Python 依赖须在 `requirements.txt` 中声明，
+> Agent 使用 `uv pip install -r requirements.txt` 自动安装（在 mcp_server_add 之前）。
 
 **`skills/<name>/server.py`**：
 ```python
@@ -178,14 +202,14 @@ if __name__ == "__main__":
     mcp.run()
 ```
 
-对应 `mcp_server_add` 调用（按平台选择 command）：
-- **Windows**：`command=".venv/Scripts/python.exe"`
-- **Linux/Mac**：`command=".venv/bin/python"`
+对应 `mcp_server_add` 调用（⚠️ command 和 args 中的文件路径必须使用绝对路径，通过 WORKSPACE_DIR 拼接）：
+- **Windows**：`command="{WORKSPACE_DIR}/.venv/Scripts/python.exe"`
+- **Linux/Mac**：`command="{WORKSPACE_DIR}/.venv/bin/python"`
 
 ```
 name="<server-name>", transport="stdio",
-command=".venv/Scripts/python.exe",  ← Linux/Mac 改为 .venv/bin/python
-args=["skills/<name>/server.py"],
+command="{WORKSPACE_DIR}/.venv/Scripts/python.exe",  ← 替换为实际绝对路径
+args=["{WORKSPACE_DIR}/skills/<name>/server.py"],    ← args 也必须用绝对路径
 lifecycle="persistent"
 ```
 
@@ -226,10 +250,10 @@ cd skills/<name> && go build -o server.exe .   # Windows
 cd skills/<name> && go build -o server .        # Unix
 ```
 
-对应 `mcp_server_add` 调用：
+对应 `mcp_server_add` 调用（⚠️ command 和 args 中的文件路径必须使用绝对路径）：
 ```
 name="<server-name>", transport="stdio",
-command="skills/<name>/server.exe", args=[],
+command="{WORKSPACE_DIR}/skills/<name>/server.exe", args=[],  ← 替换为实际绝对路径
 lifecycle="persistent"
 ```
 
@@ -244,22 +268,28 @@ lifecycle="persistent"
 
 ---
 
-## 工具命名规范
-
-- 格式：`<领域>_<动作>`，全小写，下划线分隔
-- 同一 server 下的多个工具共享同一领域前缀（如 `excel_read`、`excel_write`）
-- **MCP 适配器注册名**格式为 `mcp_<serverName>__<toolName>`（双下划线分隔）
+> 工具命名规范见 skill_doc_guide 中的「工具命名」章节。
 
 ---
 
-## 创建完成前的自查清单
+> 完整自查清单见 skill_doc_guide 中的「创建完成前的自查清单」章节。
 
-- [ ] mcp_server_list 已确认名称无冲突
-- [ ] 按运行时规则选择了正确的语言模板
-- [ ] TypeScript 路径：package.json 已创建，npm install 已执行
-- [ ] Python 路径：requirements.txt 已创建（含 mcp 依赖），提示用户手动安装
-- [ ] Go 路径：go build 已成功执行，binary 存在
-- [ ] mcp_server_add 注册成功（无冲突错误）
-- [ ] mcp_reload 返回成功，工具已出现在工具列表
-- [ ] 调用工具验证功能正常
-- [ ] README.md 已创建，包含工具列表、参数说明和示例
+---
+
+## MCP Server 连接失败诊断
+
+当 `mcp_reload` 后 server 未连接（connected +0）或工具调用报 transport error 时，按以下顺序排查：
+
+1. **检查 command 路径是否存在**：用 `shell_exec` 执行 `where <command>`（Windows）或 `which <command>`（Unix），确认可执行文件存在
+2. **检查 args 中的文件路径**：确认 server.ts / server.py / server.exe 的**绝对路径**正确，文件确实存在
+3. **检查依赖是否安装**：
+   - TypeScript：`skills/<name>/node_modules/` 目录是否存在（需先 `npm install`）
+   - Python：`uv pip install -r requirements.txt` 是否执行成功（⚠️ 不要用 `python -m uv`）
+   - Go：binary 是否已编译（`go build` 是否执行）
+4. **手动测试启动**：用 `shell_exec` 运行 command + args，观察 stderr 输出。注意：stdio server 会阻塞等待 stdin，看到启动无报错即可 Ctrl+C
+5. **检查 mcp.json 注册**：用 `mcp_server_list` 确认 server 已注册，command/args 与预期一致
+6. **常见错误模式**：
+   - `MODULE_NOT_FOUND`：npm install 未执行或 package.json 缺少依赖
+   - `No module named 'mcp'`：Python 依赖未安装，执行 `uv pip install mcp`
+   - `tsx: not found`：tsx 未全局安装，检查 `node --import tsx` 是否可用
+   - 路径含空格：确保 args 中的路径用引号包裹或无空格
